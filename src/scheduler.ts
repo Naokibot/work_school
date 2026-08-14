@@ -1,5 +1,5 @@
 import { createEmptyCard, fsrs, Rating, State, type Card, type Grade } from 'ts-fsrs'
-import type { MemoryCard, ReviewRecord, SerializedFsrsCard } from './types'
+import type { ChoicePosition, MemoryCard, ReviewRecord, SerializedFsrsCard } from './types'
 
 const scheduler = fsrs({
   request_retention: 0.9,
@@ -47,7 +47,8 @@ export function createSchedule(now = new Date()): SerializedFsrsCard {
 export function reviewCard(
   card: MemoryCard,
   correct: boolean,
-  selectedChoice: 1 | 2 | 3 | 4,
+  selectedChoice: ChoicePosition,
+  selectedAnswer: string,
   elapsedMs: number,
   now = new Date(),
 ): { card: MemoryCard; review: ReviewRecord } {
@@ -65,8 +66,9 @@ export function reviewCard(
       id: crypto.randomUUID(),
       cardId: card.id,
       question: card.question,
+      tags: [...card.tags],
       selectedChoice,
-      selectedAnswer: card.choices[selectedChoice - 1] ?? '',
+      selectedAnswer,
       correct,
       elapsedMs: Math.max(0, Math.round(elapsedMs)),
       rating: grade,
@@ -76,10 +78,14 @@ export function reviewCard(
       stateBefore: before.state,
       stateAfter: result.card.state,
       sheetSyncStatus: 'pending',
+      cardBefore: card.fsrs,
+      cardUpdatedAtBefore: card.updatedAt,
     },
   }
 }
 
 export function isCardComplete(card: MemoryCard): boolean {
-  return Boolean(card.question.trim()) && card.choices.every((choice) => Boolean(choice.trim()))
+  return Boolean(card.question.trim())
+    && Boolean(card.correctAnswer.trim())
+    && card.distractors.every((choice) => Boolean(choice.trim()))
 }
