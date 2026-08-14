@@ -85,7 +85,8 @@ export function reviewCard(
 }
 
 export function isCardComplete(card: MemoryCard): boolean {
+  const choices = [card.correctAnswer.trim(), ...card.distractors.map((choice) => choice.trim())]
   return Boolean(card.question.trim())
-    && Boolean(card.correctAnswer.trim())
-    && card.distractors.every((choice) => Boolean(choice.trim()))
+    && choices.every(Boolean)
+    && new Set(choices).size === choices.length
 }
