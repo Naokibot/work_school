@@ -12,12 +12,13 @@ import {
   putCards,
   saveReviewResult,
   saveSettings,
+  undoPendingReview,
 } from './db'
 import { exportCardsToCsv, importCardsFromCsv } from './csv'
 import { createSchedule, isCardComplete, reviewCard } from './scheduler'
 import { flushPendingReviews } from './review-sync'
 import { syncGoogleSheet } from './sheets'
-import type { MemoryCard } from './types'
+import type { ChoicePosition, MemoryCard, StudyMode } from './types'
 
 type Page = 'home' | 'study' | 'add' | 'cards' | 'stats' | 'settings'
 
@@ -31,10 +32,16 @@ let searchTerm = ''
 let searchTimer: number | undefined
 let studyQueue: MemoryCard[] = []
 let studyPosition = 0
-let selectedChoice: 1 | 2 | 3 | 4 | null = null
+let selectedChoice: ChoicePosition | null = null
 let studyQueueInitialized = false
 let syncInProgress = false
 let lastAutoSyncError = ''
+let studyMode: StudyMode = 'scheduled'
+let extraNewCards = 0
+let selectedStudyTags = new Set<string>()
+let shuffledCardId: string | null = null
+let shuffledChoices: string[] = []
+let lastUndoReviewId: string | null = null
 
 let timerDurationMs = 180_000
 let timerAccumulatedMs = 0
@@ -70,7 +77,7 @@ function localDateKey(value: number | Date): string {
 }
 
 function formatDateTime(value?: number): string {
-  if (!value) return 'まだ同期していません'
+  if (!value) return 'まだ読み込んでいません'
   return new Intl.DateTimeFormat('ja-JP', {
     month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
   }).format(new Date(value))
@@ -107,7 +114,7 @@ function showToast(message: string): void {
   toast.className = 'toast'
   toast.textContent = message
   document.body.appendChild(toast)
-  window.setTimeout(() => toast.remove(), 3200)
+  window.setTimeout(() => toast.remove(), 3600)
 }
 
 function shell(content: string): string {
@@ -180,6 +187,84 @@ function startTimerTicker(): void {
   timerTickId = window.setInterval(updateTimerDisplay, 250)
 }
 
+function isBuried(card: MemoryCard, now = Date.now()): boolean {
+  return Boolean(card.buriedUntil && card.buriedUntil > now)
+}
+
+function matchesSelectedTags(card: MemoryCard): boolean {
+  if (selectedStudyTags.size === 0) return true
+  return card.tags.some((tag) => selectedStudyTags.has(tag))
+}
+
+function availableCards(cards: MemoryCard[], now = Date.now()): MemoryCard[] {
+  return cards.filter((card) => !card.archived && !card.suspended && !isBuried(card, now) && isCardComplete(card) && matchesSelectedTags(card))
+}
+
+function modeLabel(mode: StudyMode): string {
+  const labels: Record<StudyMode, string> = {
+    scheduled: '通常（期限＋新規）',
+    due: '復習のみ',
+    all: 'タグ内すべて',
+    forgotten: '苦手カード',
+    marked: 'お気に入り',
+  }
+  return labels[mode]
+}
+
+function queueForMode(cards: MemoryCard[], newLimit: number, now = Date.now()): MemoryCard[] {
+  const active = availableCards(cards, now)
+  const due = active
+    .filter((card) => card.fsrs.state !== State.New && card.fsrs.due <= now)
+    .sort((a, b) => a.fsrs.due - b.fsrs.due)
+  const fresh = active
+    .filter((card) => card.fsrs.state === State.New)
+    .sort((a, b) => a.createdAt - b.createdAt)
+
+  switch (studyMode) {
+    case 'due': return due
+    case 'all': return [...active].sort((a, b) => a.fsrs.due - b.fsrs.due)
+    case 'forgotten': return active.filter((card) => card.fsrs.lapses > 0).sort((a, b) => b.fsrs.lapses - a.fsrs.lapses)
+    case 'marked': return active.filter((card) => card.marked).sort((a, b) => a.fsrs.due - b.fsrs.due)
+    default: return [...due, ...fresh.slice(0, newLimit + extraNewCards)]
+  }
+}
+
+function allTags(cards: MemoryCard[]): string[] {
+  return [...new Set(cards.flatMap((card) => card.tags))].sort((a, b) => a.localeCompare(b, 'ja'))
+}
+
+function randomIndex(maxExclusive: number): number {
+  if (maxExclusive <= 1) return 0
+  const buffer = new Uint32Array(1)
+  crypto.getRandomValues(buffer)
+  return (buffer[0] ?? 0) % maxExclusive
+}
+
+function shuffle(values: string[]): string[] {
+  const result = [...values]
+  for (let i = result.length - 1; i > 0; i -= 1) {
+    const j = randomIndex(i + 1)
+    const left = result[i] ?? ''
+    result[i] = result[j] ?? ''
+    result[j] = left
+  }
+  return result
+}
+
+function choicesForCard(card: MemoryCard): string[] {
+  if (shuffledCardId !== card.id) {
+    shuffledCardId = card.id
+    shuffledChoices = shuffle([card.correctAnswer, card.distractors[0], card.distractors[1]])
+  }
+  return shuffledChoices
+}
+
+function resetChoiceState(): void {
+  selectedChoice = null
+  shuffledCardId = null
+  shuffledChoices = []
+}
+
 async function renderHome(): Promise<string> {
   const [cards, reviews, settings, pending] = await Promise.all([
     getAllCards(), getAllReviews(), getSettings(), getPendingReviews(),
@@ -187,42 +272,51 @@ async function renderHome(): Promise<string> {
   const active = cards.filter((card) => !card.archived)
   const complete = active.filter(isCardComplete)
   const incomplete = active.length - complete.length
-  const now = Date.now()
-  const dueReviews = complete.filter((card) => card.fsrs.state !== State.New && card.fsrs.due <= now).length
-  const newCards = complete.filter((card) => card.fsrs.state === State.New).length
-  const availableNew = Math.min(settings.newCardsPerDay, newCards)
-  const today = localDateKey(now)
-  const todayReviews = reviews.filter((review) => localDateKey(review.reviewedAt) === today).length
-  const correctToday = reviews.filter((review) => localDateKey(review.reviewedAt) === today && review.correct).length
+  const candidates = queueForMode(cards, settings.newCardsPerDay)
+  const today = localDateKey(Date.now())
+  const todayReviews = reviews.filter((review) => localDateKey(review.reviewedAt) === today)
+  const correctToday = todayReviews.filter((review) => review.correct).length
   const streak = computeStreak(reviews.map((review) => review.reviewedAt))
+  const tags = allTags(complete)
+  const tagButtons = tags.map((tag) => `
+    <button type="button" class="tag-chip${selectedStudyTags.has(tag) ? ' selected' : ''}" data-study-tag="${escapeHtml(tag)}">#${escapeHtml(tag)}</button>
+  `).join('')
 
   return `
     <header class="page-header">
-      <div><h1>今日の学習</h1><p>4択で回答し、正誤は自分で選びます。</p></div>
+      <div><h1>今日の学習</h1><p>選択肢は毎回シャッフルされ、正誤は自分で判定します。</p></div>
       <div class="sync-status"><span class="dot ${navigator.onLine ? '' : 'offline'}"></span>${navigator.onLine ? 'オンライン' : 'オフライン'}</div>
     </header>
     <div class="grid">
       <section class="panel span-8">
-        <div class="metric"><span class="metric-label">今日取り組めるカード</span><span class="metric-value">${dueReviews + availableNew}</span></div>
-        <p class="muted">復習 ${dueReviews}枚 ＋ 新規 ${availableNew}枚</p>
-        <div class="actions"><button class="primary" type="button" data-action="start-study" ${dueReviews + availableNew === 0 ? 'disabled' : ''}>学習を始める</button><button class="secondary" type="button" data-action="sync-sheet">問題を同期</button></div>
+        <div class="metric"><span class="metric-label">現在の条件で学習するカード</span><span class="metric-value">${candidates.length}</span></div>
+        <p class="muted">${escapeHtml(modeLabel(studyMode))}${selectedStudyTags.size ? ` / タグ ${[...selectedStudyTags].map((tag) => `#${tag}`).join(' ')}` : ' / 全タグ'}</p>
+        <div class="actions">
+          <button class="primary large-action" type="button" data-action="start-study" ${candidates.length === 0 ? 'disabled' : ''}>学習を始める</button>
+          <button class="secondary large-action" type="button" data-action="import-cards" ${syncInProgress ? 'disabled' : ''}>暗記カードを読み込む</button>
+          ${studyMode === 'scheduled' ? '<button class="secondary" type="button" data-action="extra-new">今日だけ新規＋10</button>' : ''}
+        </div>
       </section>
-      <section class="panel span-4"><div class="metric"><span class="metric-label">連続学習</span><span class="metric-value">${streak}日</span></div><p class="muted">今日 ${todayReviews}問 / 正解 ${correctToday}問</p></section>
-      <section class="panel span-6 flat"><h3>Google Sheets</h3><p class="muted">最終同期 ${escapeHtml(formatDateTime(settings.lastSyncAt))}</p><p class="small muted">A: 問題文 / B〜E: 答え1〜4</p></section>
-      <section class="panel span-6 flat"><h3>データ状態</h3><p class="muted">カード ${complete.length}枚${incomplete ? ` / 未完成 ${incomplete}枚` : ''}</p><p class="small muted">Sheet2未送信の回答記録 ${pending.length}件</p></section>
+      <section class="panel span-4"><div class="metric"><span class="metric-label">連続学習</span><span class="metric-value">${streak}日</span></div><p class="muted">今日 ${todayReviews.length}問 / 正解 ${correctToday}問</p></section>
+
+      <section class="panel span-12 flat">
+        <div class="study-filter-head"><div><h3>学習範囲</h3><p class="small muted">AnkiのCustom Studyに近い使い方です。</p></div><select id="study-mode" class="study-mode-select">
+          ${(['scheduled', 'due', 'all', 'forgotten', 'marked'] as StudyMode[]).map((mode) => `<option value="${mode}" ${studyMode === mode ? 'selected' : ''}>${escapeHtml(modeLabel(mode))}</option>`).join('')}
+        </select></div>
+        <div class="tag-toolbar"><button type="button" class="tag-chip ${selectedStudyTags.size === 0 ? 'selected' : ''}" data-action="clear-study-tags">すべて</button>${tagButtons || '<span class="small muted">タグ付きカードを読み込むとここに表示されます。</span>'}</div>
+      </section>
+
+      <section class="panel span-6 flat"><h3>Google Sheets</h3><p class="muted">最終読込 ${escapeHtml(formatDateTime(settings.lastSyncAt))}</p><p class="small muted">A=問題 / B=正解 / C・D=誤答 / E=タグ。スプレッドシート本体は非公開のまま利用できます。</p></section>
+      <section class="panel span-6 flat"><h3>データ状態</h3><p class="muted">カード ${complete.length}枚${incomplete ? ` / 未完成 ${incomplete}枚` : ''}</p><p class="small muted">停止 ${active.filter((card) => card.suspended).length}枚 / お気に入り ${active.filter((card) => card.marked).length}枚 / Sheet2未送信 ${pending.length}件</p></section>
     </div>
   `
 }
 
 async function initializeStudyQueue(): Promise<void> {
   const [cards, settings] = await Promise.all([getAllCards(), getSettings()])
-  const now = Date.now()
-  const active = cards.filter((card) => !card.archived && isCardComplete(card))
-  const due = active.filter((card) => card.fsrs.state !== State.New && card.fsrs.due <= now).sort((a, b) => a.fsrs.due - b.fsrs.due)
-  const fresh = active.filter((card) => card.fsrs.state === State.New).sort((a, b) => a.createdAt - b.createdAt).slice(0, settings.newCardsPerDay)
-  studyQueue = [...due, ...fresh]
+  studyQueue = queueForMode(cards, settings.newCardsPerDay)
   studyPosition = 0
-  selectedChoice = null
+  resetChoiceState()
   studyQueueInitialized = true
   resetQuestionTimer(settings.questionTimerSeconds)
 }
@@ -233,32 +327,33 @@ async function renderStudy(): Promise<string> {
   if (!card) {
     pauseTimer()
     return `
-      <header class="page-header"><div><h1>学習完了</h1><p>今回のセッションは終了です。</p></div></header>
+      <header class="page-header"><div><h1>学習完了</h1><p>今回のセッションは終了です。</p></div>${lastUndoReviewId ? '<button class="secondary" type="button" data-action="undo-last">直前の回答を取り消す</button>' : ''}</header>
       <section class="panel empty"><strong>おつかれさまでした</strong>回答履歴は端末に保存され、設定済みならSheet2へ送信されます。<div class="actions center-actions"><button class="primary" data-page="home" type="button">ホームへ</button></div></section>
     `
   }
 
-  const choices = card.choices.map((choice, index) => `
+  const choices = choicesForCard(card)
+  const choiceButtons = choices.map((choice, index) => `
     <button class="choice-button${selectedChoice === index + 1 ? ' selected' : ''}" type="button" data-choice="${index + 1}">
       <span class="choice-number">${index + 1}</span><span>${textBlock(choice)}</span>
     </button>
   `).join('')
+  const tagBadges = card.tags.map((tag) => `<span class="badge">#${escapeHtml(tag)}</span>`).join('')
 
   return `
     <header class="page-header study-header">
       <div><h1>学習</h1><p>${studyPosition + 1} / ${studyQueue.length}　${escapeHtml(card.deck)}</p></div>
-      <div class="study-header-actions"><div id="question-timer" class="question-timer">00:00</div><button class="ghost" type="button" data-action="end-study">終了</button></div>
+      <div class="study-header-actions">${lastUndoReviewId ? '<button class="secondary compact" type="button" data-action="undo-last">Undo</button>' : ''}<div id="question-timer" class="question-timer">00:00</div><button class="ghost" type="button" data-action="end-study">終了</button></div>
     </header>
     <section class="study-layout">
       <div class="panel question-panel">
+        <div class="study-meta"><div class="badges">${tagBadges}</div><div class="card-tools"><button class="mini-tool${card.marked ? ' active' : ''}" type="button" data-action="mark-current">${card.marked ? '★ お気に入り' : '☆ お気に入り'}</button><button class="mini-tool" type="button" data-action="bury-current">今日だけ隠す</button><button class="mini-tool" type="button" data-action="suspend-current">停止</button></div></div>
         <div class="study-question">${textBlock(card.question)}</div>
-        <div class="choice-grid">${choices}</div>
+        <div class="choice-grid three-choice">${choiceButtons}</div>
         <div id="self-assessment" class="self-assessment" ${selectedChoice ? '' : 'hidden'}>
-          <div><strong>この回答はどうでしたか？</strong><span id="selected-answer-label" class="muted small">${selectedChoice ? `答え${selectedChoice}を選択` : ''}</span></div>
-          <div class="self-buttons">
-            <button class="self-button correct" type="button" data-self-result="correct">正解だった</button>
-            <button class="self-button incorrect" type="button" data-self-result="incorrect">間違えた</button>
-          </div>
+          <div class="correct-answer-box"><span class="small muted">正解</span><strong>${textBlock(card.correctAnswer)}</strong></div>
+          <div><strong>自分の回答はどうでしたか？</strong><span id="selected-answer-label" class="muted small">${selectedChoice ? `選択肢${selectedChoice}を選択` : ''}</span></div>
+          <div class="self-buttons"><button class="self-button correct" type="button" data-self-result="correct">正解だった</button><button class="self-button incorrect" type="button" data-self-result="incorrect">間違えた</button></div>
         </div>
         ${card.note ? `<div class="study-note">${textBlock(card.note)}</div>` : ''}
       </div>
@@ -268,25 +363,22 @@ async function renderStudy(): Promise<string> {
         <div class="timer-controls"><button class="secondary" type="button" data-action="timer-toggle">一時停止</button><button class="secondary" type="button" data-action="timer-reset">タイマーをリセット</button></div>
       </aside>
     </section>
-    <p class="small muted keyboard-help">外付けキーボード: 1〜4で回答 / Cで正解 / Xで不正解</p>
+    <p class="small muted keyboard-help">外付けキーボード: 1〜3で回答 / Cで正解 / Xで不正解 / UでUndo</p>
   `
 }
 
 async function renderEditor(): Promise<string> {
   const existing = editingId ? (await getAllCards()).find((card) => card.id === editingId) : undefined
   const title = existing ? 'カードを編集' : 'カードを追加'
-  const answerFields = [0, 1, 2, 3].map((index) => `
-    <div class="field"><label for="answer${index + 1}">答え${index + 1}</label><textarea id="answer${index + 1}" name="answer${index + 1}" required>${existing ? escapeHtml(existing.choices[index] ?? '') : ''}</textarea></div>
-  `).join('')
-
   return `
-    <header class="page-header"><div><h1>${title}</h1><p>正解の指定は不要です。4つの選択肢だけ登録します。</p></div></header>
+    <header class="page-header"><div><h1>${title}</h1><p>正解1つと誤答2つを登録します。学習時の表示順は自動でシャッフルされます。</p></div></header>
     <section class="panel">
-      ${existing?.source === 'google-sheet' ? '<div class="notice">Sheets由来のカードは次回同期時にA〜E列の内容へ戻ります。</div>' : ''}
+      ${existing?.source === 'google-sheet' ? '<div class="notice">Sheets由来のカードは次回読込時にA〜E列の内容へ戻ります。</div>' : ''}
       <form class="form" id="card-form">
         <div class="field"><label for="question">問題文</label><textarea id="question" name="question" required autocomplete="off">${existing ? escapeHtml(existing.question) : ''}</textarea></div>
-        <div class="answer-editor-grid">${answerFields}</div>
-        <div class="field-row"><div class="field"><label for="deck">デッキ</label><input id="deck" name="deck" value="${escapeHtml(existing?.deck ?? '一般')}" maxlength="80"></div><div class="field"><label for="tags">タグ</label><input id="tags" name="tags" value="${escapeHtml(existing?.tags.join(', ') ?? '')}" placeholder="数学, 高専"></div></div>
+        <div class="field correct-field"><label for="correctAnswer">正解</label><textarea id="correctAnswer" name="correctAnswer" required>${existing ? escapeHtml(existing.correctAnswer) : ''}</textarea></div>
+        <div class="answer-editor-grid"><div class="field"><label for="wrongAnswer1">誤答1</label><textarea id="wrongAnswer1" name="wrongAnswer1" required>${existing ? escapeHtml(existing.distractors[0]) : ''}</textarea></div><div class="field"><label for="wrongAnswer2">誤答2</label><textarea id="wrongAnswer2" name="wrongAnswer2" required>${existing ? escapeHtml(existing.distractors[1]) : ''}</textarea></div></div>
+        <div class="field-row"><div class="field"><label for="deck">デッキ</label><input id="deck" name="deck" value="${escapeHtml(existing?.deck ?? '一般')}" maxlength="80"></div><div class="field"><label for="tags">タグ</label><input id="tags" name="tags" value="${escapeHtml(existing?.tags.join(', ') ?? '')}" placeholder="数学, 図形, 高専"></div></div>
         <div class="field"><label for="note">メモ</label><textarea id="note" name="note" placeholder="任意の補足">${existing ? escapeHtml(existing.note) : ''}</textarea></div>
         <div class="actions"><button class="primary" type="submit">${existing ? '保存' : '登録'}</button>${existing ? '<button class="secondary" type="button" data-page="cards">キャンセル</button>' : ''}</div>
       </form>
@@ -295,32 +387,38 @@ async function renderEditor(): Promise<string> {
 }
 
 async function renderCards(): Promise<string> {
-  const all = (await getAllCards()).filter((card) => !card.archived)
+  const [allCards, settings] = await Promise.all([getAllCards(), getSettings()])
+  const all = allCards.filter((card) => !card.archived)
   const query = searchTerm.trim().toLowerCase()
-  const filtered = query ? all.filter((card) => [card.question, ...card.choices, card.deck, card.note, ...card.tags].some((value) => value.toLowerCase().includes(query))) : all
-  filtered.sort((a, b) => b.updatedAt - a.updatedAt)
+  const filtered = query ? all.filter((card) => [card.question, card.correctAnswer, ...card.distractors, card.deck, card.note, ...card.tags].some((value) => value.toLowerCase().includes(query))) : all
+  filtered.sort((a, b) => Number(b.marked) - Number(a.marked) || b.updatedAt - a.updatedAt)
   const shown = filtered.slice(0, 300)
-  const rows = shown.map((card) => `
-    <article class="card-row">
-      <div><div class="card-front">${textBlock(card.question)}</div><ol class="choice-preview">${card.choices.map((choice) => `<li>${choice ? textBlock(choice) : '<em>未登録</em>'}</li>`).join('')}</ol><div class="badges"><span class="badge">${escapeHtml(card.deck)}</span><span class="badge">${card.source === 'google-sheet' ? `Sheets${card.sourceRow ? ` #${card.sourceRow}` : ''}` : 'サイト登録'}</span><span class="badge">${isCardComplete(card) ? '学習可能' : '未完成'}</span>${card.tags.map((tag) => `<span class="badge">#${escapeHtml(tag)}</span>`).join('')}</div></div>
-      <div class="actions"><button class="icon-button" type="button" data-edit-card="${card.id}">編集</button><button class="icon-button" type="button" data-delete-card="${card.id}">削除</button></div>
-    </article>
-  `).join('')
+  const rows = shown.map((card) => {
+    const state = card.suspended ? '停止中' : isBuried(card) ? '今日だけ非表示' : isCardComplete(card) ? '学習可能' : '未完成'
+    const leech = card.fsrs.lapses >= settings.leechThreshold
+    return `
+      <article class="card-row${card.suspended ? ' suspended-row' : ''}">
+        <div><div class="card-front">${card.marked ? '★ ' : ''}${textBlock(card.question)}</div><ol class="choice-preview"><li><strong>正解:</strong> ${textBlock(card.correctAnswer || '未登録')}</li><li>誤答: ${textBlock(card.distractors[0] || '未登録')}</li><li>誤答: ${textBlock(card.distractors[1] || '未登録')}</li></ol><div class="badges"><span class="badge">${escapeHtml(card.deck)}</span><span class="badge">${card.source === 'google-sheet' ? `Sheets${card.sourceRow ? ` #${card.sourceRow}` : ''}` : 'サイト登録'}</span><span class="badge">${state}</span>${leech ? '<span class="badge warning-badge">苦手</span>' : ''}${card.tags.map((tag) => `<span class="badge">#${escapeHtml(tag)}</span>`).join('')}</div></div>
+        <div class="actions"><button class="icon-button" type="button" data-mark-card="${card.id}">${card.marked ? '★' : '☆'}</button><button class="icon-button" type="button" data-suspend-card="${card.id}">${card.suspended ? '再開' : '停止'}</button>${isBuried(card) ? `<button class="icon-button" type="button" data-unbury-card="${card.id}">戻す</button>` : ''}<button class="icon-button" type="button" data-edit-card="${card.id}">編集</button><button class="icon-button" type="button" data-delete-card="${card.id}">削除</button></div>
+      </article>
+    `
+  }).join('')
   return `
     <header class="page-header"><div><h1>カード</h1><p>${filtered.length}枚${filtered.length > 300 ? '（先頭300枚を表示）' : ''}</p></div><button class="primary" type="button" data-page="add">＋ 追加</button></header>
-    <div class="search-wrap"><input class="search" id="card-search" type="search" value="${escapeHtml(searchTerm)}" placeholder="問題・答え・デッキ・タグを検索"></div>
-    <div class="card-list">${rows || '<section class="panel empty"><strong>カードがありません</strong>サイトまたはGoogle Sheetsから追加できます。</section>'}</div>
+    <div class="search-wrap"><input class="search" id="card-search" type="search" value="${escapeHtml(searchTerm)}" placeholder="問題・正解・タグ・デッキを検索"></div>
+    <div class="card-list">${rows || '<section class="panel empty"><strong>カードがありません</strong>「暗記カードを読み込む」またはサイトから追加できます。</section>'}</div>
   `
 }
 
 async function renderStats(): Promise<string> {
-  const reviews = await getAllReviews()
+  const [reviews, cards, settings] = await Promise.all([getAllReviews(), getAllCards(), getSettings()])
   const today = localDateKey(Date.now())
   const todayReviews = reviews.filter((review) => localDateKey(review.reviewedAt) === today)
   const correct = reviews.filter((review) => review.correct).length
   const incorrect = reviews.length - correct
   const pending = reviews.filter((review) => review.sheetSyncStatus !== 'sent').length
   const streak = computeStreak(reviews.map((review) => review.reviewedAt))
+  const leeches = cards.filter((card) => !card.archived && card.fsrs.lapses >= settings.leechThreshold).length
   const days = Array.from({ length: 7 }, (_, index) => {
     const date = new Date()
     date.setHours(0, 0, 0, 0)
@@ -337,33 +435,32 @@ async function renderStats(): Promise<string> {
       <section class="panel span-3"><div class="metric"><span class="metric-label">今日</span><span class="metric-value">${todayReviews.length}</span></div><p class="muted">回答</p></section>
       <section class="panel span-3"><div class="metric"><span class="metric-label">正解</span><span class="metric-value">${correct}</span></div><p class="muted">累計</p></section>
       <section class="panel span-3"><div class="metric"><span class="metric-label">不正解</span><span class="metric-value">${incorrect}</span></div><p class="muted">累計</p></section>
-      <section class="panel span-3"><div class="metric"><span class="metric-label">平均</span><span class="metric-value">${averageSeconds}秒</span></div><p class="muted">回答時間</p></section>
+      <section class="panel span-3"><div class="metric"><span class="metric-label">苦手</span><span class="metric-value">${leeches}</span></div><p class="muted">${settings.leechThreshold}回以上失敗</p></section>
       <section class="panel span-8"><h3>直近7日</h3><div class="bar-list">${days.map((day) => `<div class="bar-row"><span>${day.label}</span><div class="bar-track"><div class="bar-fill" style="width:${Math.round((day.count / max) * 100)}%"></div></div><strong>${day.count}</strong></div>`).join('')}</div></section>
-      <section class="panel span-4"><h3>同期</h3><p class="small muted">連続学習 ${streak}日</p><p class="small muted">Sheet2未送信 ${pending}件</p><p class="small muted">FSRS: 正解→Good / 不正解→Again</p></section>
+      <section class="panel span-4"><h3>学習状況</h3><p class="small muted">平均回答時間 ${averageSeconds}秒</p><p class="small muted">連続学習 ${streak}日</p><p class="small muted">Sheet2未送信 ${pending}件</p><p class="small muted">FSRS: 自己申告の正解→Good / 不正解→Again</p></section>
     </div>
   `
 }
 
 async function renderSettings(): Promise<string> {
   const settings = await getSettings()
-  const sheetUrl = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(settings.sheetId)}/edit?gid=${encodeURIComponent(settings.sheetGid)}#gid=${encodeURIComponent(settings.sheetGid)}`
   const theme = document.documentElement.dataset.theme ?? 'light'
   return `
-    <header class="page-header"><div><h1>設定</h1><p>問題同期、タイマー、Sheet2記録を設定します。</p></div></header>
+    <header class="page-header"><div><h1>設定</h1><p>非公開Google Sheets、学習量、タイマー、記録を設定します。</p></div></header>
     <div class="grid">
-      <section class="panel span-12"><h3>Google Sheets 問題同期</h3><div class="notice"><strong>A=問題文 / B=答え1 / C=答え2 / D=答え3 / E=答え4</strong><br>5項目が揃わない行はスキップします。</div><form class="form" id="settings-form">
-        <div class="field"><label for="sheetId">Spreadsheet ID</label><input id="sheetId" name="sheetId" value="${escapeHtml(settings.sheetId)}" required></div>
-        <div class="field-row"><div class="field"><label for="sheetGid">問題シート gid</label><input id="sheetGid" name="sheetGid" inputmode="numeric" value="${escapeHtml(settings.sheetGid)}" required></div><div class="field"><label for="newCardsPerDay">1日の新規カード上限</label><input id="newCardsPerDay" name="newCardsPerDay" type="number" min="0" max="500" value="${settings.newCardsPerDay}" required></div></div>
-        <div class="field"><label for="questionTimerSeconds">1問のタイマー（秒）</label><input id="questionTimerSeconds" name="questionTimerSeconds" type="number" min="10" max="3600" value="${settings.questionTimerSeconds}" required></div>
-        <label class="check-row"><input id="autoSync" name="autoSync" type="checkbox" ${settings.autoSync ? 'checked' : ''}> サイトを開いている間、自動同期する</label>
-        <hr class="divider"><h3>Sheet2 回答記録</h3><p class="help">Apps Script Web Appを1回デプロイし、そのURLとWRITE_TOKENを入力します。トークンはGitHubには保存されず、この端末のIndexedDBだけに保存されます。</p>
-        <div class="field"><label for="reviewWebAppUrl">Apps Script Web App URL</label><input id="reviewWebAppUrl" name="reviewWebAppUrl" type="url" value="${escapeHtml(settings.reviewWebAppUrl)}" placeholder="https://script.google.com/macros/s/.../exec"></div>
-        <div class="field"><label for="reviewWriteToken">WRITE_TOKEN</label><input id="reviewWriteToken" name="reviewWriteToken" type="password" value="${escapeHtml(settings.reviewWriteToken)}" autocomplete="off"></div>
-        <div class="actions"><button class="primary" type="submit">設定を保存</button><button class="secondary" type="button" data-action="sync-sheet">問題を同期</button><button class="secondary" type="button" data-action="flush-reviews">未送信記録を送る</button><a class="secondary link-button" href="${sheetUrl}" target="_blank" rel="noopener noreferrer">スプレッドシートを開く</a></div>
-        <p class="help">最終問題同期: ${escapeHtml(formatDateTime(settings.lastSyncAt))}${settings.lastSyncMessage ? ` / ${escapeHtml(settings.lastSyncMessage)}` : ''}</p>
+      <section class="panel span-12"><h3>Google Sheets / Apps Script</h3><div class="notice"><strong>スプレッドシートは非公開のままで構いません。</strong><br>A=問題、B=正解、C・D=誤答、E=タグです。Apps ScriptのScript PropertiesにSpreadsheet IDを置き、ブラウザにはURLとACCESS_TOKENだけを保存します。</div><form class="form" id="settings-form">
+        <div class="field"><label for="appsScriptUrl">Apps Script Web App URL</label><input id="appsScriptUrl" name="appsScriptUrl" type="url" value="${escapeHtml(settings.appsScriptUrl)}" placeholder="https://script.google.com/macros/s/.../exec"></div>
+        <div class="field"><label for="accessToken">ACCESS_TOKEN</label><input id="accessToken" name="accessToken" type="password" value="${escapeHtml(settings.accessToken)}" autocomplete="off"></div>
+        <div class="field-row"><div class="field"><label for="newCardsPerDay">1日の新規カード上限</label><input id="newCardsPerDay" name="newCardsPerDay" type="number" min="0" max="500" value="${settings.newCardsPerDay}" required></div><div class="field"><label for="questionTimerSeconds">1問のタイマー（秒）</label><input id="questionTimerSeconds" name="questionTimerSeconds" type="number" min="10" max="3600" value="${settings.questionTimerSeconds}" required></div></div>
+        <div class="field-row"><div class="field"><label for="leechThreshold">苦手カード判定（失敗回数）</label><input id="leechThreshold" name="leechThreshold" type="number" min="2" max="50" value="${settings.leechThreshold}" required></div><div></div></div>
+        <label class="check-row"><input id="autoSync" name="autoSync" type="checkbox" ${settings.autoSync ? 'checked' : ''}> アプリを開いている間、自動で暗記カードを読み込む</label>
+        <label class="check-row"><input id="autoSuspendLeeches" name="autoSuspendLeeches" type="checkbox" ${settings.autoSuspendLeeches ? 'checked' : ''}> 苦手判定に達したカードを自動で停止する</label>
+        <label class="check-row"><input id="detailedReviewLogging" name="detailedReviewLogging" type="checkbox" ${settings.detailedReviewLogging ? 'checked' : ''}> Sheet2へ問題文・選択した答えも記録する（個人情報最小化のため初期値OFF）</label>
+        <div class="actions"><button class="primary" type="submit">設定を保存</button><button class="secondary large-action" type="button" data-action="import-cards">暗記カードを読み込む</button><button class="secondary" type="button" data-action="flush-reviews">未送信記録を送る</button></div>
+        <p class="help">最終読込: ${escapeHtml(formatDateTime(settings.lastSyncAt))}${settings.lastSyncMessage ? ` / ${escapeHtml(settings.lastSyncMessage)}` : ''}</p>
       </form></section>
-      <section class="panel span-6"><h3>バックアップ</h3><p class="small muted">カード、FSRS履歴、設定をJSONへ保存します。</p><div class="actions"><button class="secondary" type="button" data-action="export-backup">JSON保存</button><label class="secondary file-button">JSON復元<input id="backup-import" type="file" accept="application/json,.json" hidden></label></div></section>
-      <section class="panel span-6"><h3>CSV</h3><p class="small muted">question, answer1, answer2, answer3, answer4, deck, tags, note</p><div class="actions"><button class="secondary" type="button" data-action="export-csv">CSV保存</button><label class="secondary file-button">CSV読込<input id="csv-import" type="file" accept="text/csv,.csv" hidden></label></div></section>
+      <section class="panel span-6"><h3>バックアップ</h3><p class="small muted">カードとFSRS履歴を保存します。ACCESS_TOKENはバックアップへ含めません。</p><div class="actions"><button class="secondary" type="button" data-action="export-backup">JSON保存</button><label class="secondary file-button">JSON復元<input id="backup-import" type="file" accept="application/json,.json" hidden></label></div></section>
+      <section class="panel span-6"><h3>CSV</h3><p class="small muted">question, correct_answer, wrong_answer1, wrong_answer2, tags, deck, note</p><div class="actions"><button class="secondary" type="button" data-action="export-csv">CSV保存</button><label class="secondary file-button">CSV読込<input id="csv-import" type="file" accept="text/csv,.csv" hidden></label></div></section>
       <section class="panel span-12 flat"><h3>表示</h3><button class="secondary" type="button" data-action="toggle-theme">${theme === 'dark' ? 'ライトモード' : 'ダークモード'}へ</button></section>
     </div>
   `
@@ -397,17 +494,17 @@ function goTo(page: Page): void {
 
 async function runSheetSync(showResult: boolean): Promise<void> {
   if (syncInProgress || !navigator.onLine) {
-    if (showResult && !navigator.onLine) showToast('オフラインのため同期できません。')
+    if (showResult && !navigator.onLine) showToast('オフラインのため読み込めません。')
     return
   }
   syncInProgress = true
   try {
     const summary = await syncGoogleSheet()
     lastAutoSyncError = ''
-    if (showResult) showToast(`同期完了: ${summary.created}件追加・${summary.updated}件更新・${summary.skipped}件スキップ`)
+    if (showResult) showToast(`読込完了: ${summary.created}件追加・${summary.updated}件更新・${summary.skipped}件スキップ`)
     if (['home', 'cards', 'settings'].includes(currentPage)) await render()
   } catch (error) {
-    const message = error instanceof Error ? error.message : '同期に失敗しました。'
+    const message = error instanceof Error ? error.message : '暗記カードの読み込みに失敗しました。'
     if (showResult || message !== lastAutoSyncError) {
       if (showResult) showToast(message)
       lastAutoSyncError = message
@@ -420,19 +517,43 @@ async function runSheetSync(showResult: boolean): Promise<void> {
 async function completeCurrentReview(correct: boolean): Promise<void> {
   const card = studyQueue[studyPosition]
   if (!card || selectedChoice === null) return
+  const selectedAnswer = choicesForCard(card)[selectedChoice - 1] ?? ''
+  if (!selectedAnswer) return
   pauseTimer()
-  const result = reviewCard(card, correct, selectedChoice, timerElapsedMs())
+  const settings = await getSettings()
+  const result = reviewCard(card, correct, selectedChoice, selectedAnswer, timerElapsedMs())
+  if (!correct && settings.autoSuspendLeeches && result.card.fsrs.lapses >= settings.leechThreshold) {
+    result.card.suspended = true
+  }
   await saveReviewResult(result.card, result.review)
+  lastUndoReviewId = result.review.id
   studyQueue[studyPosition] = result.card
   studyPosition += 1
-  selectedChoice = null
-  const settings = await getSettings()
+  resetChoiceState()
   resetQuestionTimer(settings.questionTimerSeconds)
   await render()
-  void flushPendingReviews()
 }
 
-function selectChoice(choice: 1 | 2 | 3 | 4): void {
+async function undoLastReview(): Promise<void> {
+  if (!lastUndoReviewId) return
+  const restored = await undoPendingReview(lastUndoReviewId)
+  if (!restored) {
+    lastUndoReviewId = null
+    showToast('この回答はすでにSheet2へ送信済みのため取り消せません。')
+    await render()
+    return
+  }
+  lastUndoReviewId = null
+  studyPosition = Math.max(0, studyPosition - 1)
+  studyQueue[studyPosition] = { ...restored, suspended: false }
+  resetChoiceState()
+  const settings = await getSettings()
+  resetQuestionTimer(settings.questionTimerSeconds)
+  showToast('直前の回答を取り消しました。')
+  await render()
+}
+
+function selectChoice(choice: ChoicePosition): void {
   selectedChoice = choice
   document.querySelectorAll<HTMLElement>('[data-choice]').forEach((button) => {
     button.classList.toggle('selected', Number(button.dataset.choice) === choice)
@@ -440,7 +561,42 @@ function selectChoice(choice: 1 | 2 | 3 | 4): void {
   const assessment = document.getElementById('self-assessment')
   if (assessment) assessment.hidden = false
   const label = document.getElementById('selected-answer-label')
-  if (label) label.textContent = `答え${choice}を選択`
+  if (label) label.textContent = `選択肢${choice}を選択`
+}
+
+function tomorrowStart(): number {
+  const date = new Date()
+  date.setHours(24, 0, 0, 0)
+  return date.getTime()
+}
+
+async function skipCurrentCard(mode: 'bury' | 'suspend'): Promise<void> {
+  const card = studyQueue[studyPosition]
+  if (!card) return
+  const updated: MemoryCard = mode === 'bury'
+    ? { ...card, buriedUntil: tomorrowStart(), updatedAt: Date.now() }
+    : { ...card, suspended: true, buriedUntil: undefined, updatedAt: Date.now() }
+  await putCard(updated)
+  studyQueue[studyPosition] = updated
+  studyPosition += 1
+  resetChoiceState()
+  const settings = await getSettings()
+  resetQuestionTimer(settings.questionTimerSeconds)
+  showToast(mode === 'bury' ? 'このカードを明日まで隠しました。' : 'このカードを停止しました。')
+  await render()
+}
+
+async function toggleCurrentMarked(): Promise<void> {
+  const card = studyQueue[studyPosition]
+  if (!card) return
+  const updated = { ...card, marked: !card.marked, updatedAt: Date.now() }
+  await putCard(updated)
+  studyQueue[studyPosition] = updated
+  const button = document.querySelector<HTMLButtonElement>('[data-action="mark-current"]')
+  if (button) {
+    button.textContent = updated.marked ? '★ お気に入り' : '☆ お気に入り'
+    button.classList.toggle('active', updated.marked)
+  }
 }
 
 function attachScratchpad(): void {
@@ -482,26 +638,62 @@ function attachScratchpad(): void {
   }
   canvas.addEventListener('pointerup', stop)
   canvas.addEventListener('pointercancel', stop)
+  document.querySelector('[data-action="clear-scratch"]')?.addEventListener('click', () => context.clearRect(0, 0, rect.width, rect.height))
+}
 
-  document.querySelector('[data-action="clear-scratch"]')?.addEventListener('click', () => {
-    context.clearRect(0, 0, rect.width, rect.height)
-  })
+async function updateCardState(id: string, action: 'mark' | 'suspend' | 'unbury'): Promise<void> {
+  const card = (await getAllCards()).find((candidate) => candidate.id === id)
+  if (!card) return
+  let updated = card
+  if (action === 'mark') updated = { ...card, marked: !card.marked, updatedAt: Date.now() }
+  if (action === 'suspend') updated = { ...card, suspended: !card.suspended, buriedUntil: undefined, updatedAt: Date.now() }
+  if (action === 'unbury') updated = { ...card, buriedUntil: undefined, updatedAt: Date.now() }
+  await putCard(updated)
+  await render()
 }
 
 function attachHandlers(): void {
   document.querySelectorAll<HTMLElement>('[data-page]').forEach((button) => button.addEventListener('click', () => goTo(button.dataset.page as Page)))
   document.querySelector('[data-action="start-study"]')?.addEventListener('click', () => goTo('study'))
   document.querySelector('[data-action="end-study"]')?.addEventListener('click', () => goTo('home'))
+  document.querySelectorAll('[data-action="import-cards"]').forEach((button) => button.addEventListener('click', () => void runSheetSync(true)))
+  document.querySelector('[data-action="extra-new"]')?.addEventListener('click', async () => {
+    extraNewCards += 10
+    showToast(`今日の新規カードを${extraNewCards}枚追加しました。`)
+    await render()
+  })
+  document.querySelector('[data-action="clear-study-tags"]')?.addEventListener('click', async () => {
+    selectedStudyTags.clear()
+    await render()
+  })
+  document.querySelectorAll<HTMLElement>('[data-study-tag]').forEach((button) => button.addEventListener('click', async () => {
+    const tag = button.dataset.studyTag
+    if (!tag) return
+    if (selectedStudyTags.has(tag)) selectedStudyTags.delete(tag)
+    else selectedStudyTags.add(tag)
+    await render()
+  }))
+  const modeSelect = document.querySelector<HTMLSelectElement>('#study-mode')
+  modeSelect?.addEventListener('change', async () => {
+    const value = modeSelect.value as StudyMode
+    if (['scheduled', 'due', 'all', 'forgotten', 'marked'].includes(value)) studyMode = value
+    await render()
+  })
+
   document.querySelectorAll<HTMLElement>('[data-choice]').forEach((button) => button.addEventListener('click', () => {
     const choice = Number(button.dataset.choice)
-    if ([1, 2, 3, 4].includes(choice)) selectChoice(choice as 1 | 2 | 3 | 4)
+    if ([1, 2, 3].includes(choice)) selectChoice(choice as ChoicePosition)
   }))
   document.querySelectorAll<HTMLElement>('[data-self-result]').forEach((button) => button.addEventListener('click', () => void completeCurrentReview(button.dataset.selfResult === 'correct')))
-
+  document.querySelector('[data-action="undo-last"]')?.addEventListener('click', () => void undoLastReview())
+  document.querySelector('[data-action="bury-current"]')?.addEventListener('click', () => void skipCurrentCard('bury'))
+  document.querySelector('[data-action="suspend-current"]')?.addEventListener('click', () => void skipCurrentCard('suspend'))
+  document.querySelector('[data-action="mark-current"]')?.addEventListener('click', () => void toggleCurrentMarked())
   document.querySelector('[data-action="timer-toggle"]')?.addEventListener('click', () => timerRunning ? pauseTimer() : resumeTimer())
   document.querySelector('[data-action="timer-reset"]')?.addEventListener('click', () => resetQuestionTimer(Math.round(timerDurationMs / 1000)))
-  document.querySelectorAll('[data-action="sync-sheet"]').forEach((button) => button.addEventListener('click', () => void runSheetSync(true)))
+
   document.querySelector('[data-action="flush-reviews"]')?.addEventListener('click', async () => {
+    lastUndoReviewId = null
     const result = await flushPendingReviews(100)
     showToast(result.sent ? `${result.sent}件をSheet2へ送信しました。` : '送信できる記録がありません。設定・通信を確認してください。')
     await render()
@@ -512,23 +704,42 @@ function attachHandlers(): void {
     event.preventDefault()
     const data = new FormData(form)
     const question = String(data.get('question') ?? '').trim()
-    const choices: [string, string, string, string] = [1, 2, 3, 4].map((index) => String(data.get(`answer${index}`) ?? '').trim()) as [string, string, string, string]
-    if (!question || choices.some((choice) => !choice)) {
-      showToast('問題文と4つの答えをすべて入力してください。')
+    const correctAnswer = String(data.get('correctAnswer') ?? '').trim()
+    const wrongAnswer1 = String(data.get('wrongAnswer1') ?? '').trim()
+    const wrongAnswer2 = String(data.get('wrongAnswer2') ?? '').trim()
+    if (!question || !correctAnswer || !wrongAnswer1 || !wrongAnswer2) {
+      showToast('問題文・正解・誤答2つをすべて入力してください。')
       return
     }
     const now = Date.now()
-    const existing = editingId ? (await getAllCards()).find((card) => card.id === editingId) : undefined
+    const all = await getAllCards()
+    const existing = editingId ? all.find((card) => card.id === editingId) : undefined
+    const duplicate = all.find((card) => card.id !== existing?.id && card.question.trim().toLowerCase() === question.toLowerCase())
+    if (duplicate && !window.confirm('同じ問題文のカードがすでにあります。それでも保存しますか？')) return
+    const tags = [...new Set(String(data.get('tags') ?? '').split(/[,;|]/).map((tag) => tag.trim()).filter(Boolean))]
     const card: MemoryCard = existing ? {
-      ...existing, question, choices,
+      ...existing,
+      question,
+      correctAnswer,
+      distractors: [wrongAnswer1, wrongAnswer2],
       deck: String(data.get('deck') ?? '').trim() || '一般',
-      tags: String(data.get('tags') ?? '').split(',').map((tag) => tag.trim()).filter(Boolean),
-      note: String(data.get('note') ?? '').trim(), updatedAt: now,
+      tags,
+      note: String(data.get('note') ?? '').trim(),
+      updatedAt: now,
     } : {
-      id: crypto.randomUUID(), question, choices,
+      id: crypto.randomUUID(),
+      question,
+      correctAnswer,
+      distractors: [wrongAnswer1, wrongAnswer2],
       deck: String(data.get('deck') ?? '').trim() || '一般',
-      tags: String(data.get('tags') ?? '').split(',').map((tag) => tag.trim()).filter(Boolean),
-      note: String(data.get('note') ?? '').trim(), source: 'manual', createdAt: now, updatedAt: now, archived: false,
+      tags,
+      note: String(data.get('note') ?? '').trim(),
+      source: 'manual',
+      createdAt: now,
+      updatedAt: now,
+      archived: false,
+      suspended: false,
+      marked: false,
       fsrs: createSchedule(new Date(now)),
     }
     await putCard(card)
@@ -545,6 +756,15 @@ function attachHandlers(): void {
     searchTimer = window.setTimeout(() => { if (currentPage === 'cards') void render() }, 150)
   })
 
+  document.querySelectorAll<HTMLElement>('[data-mark-card]').forEach((button) => button.addEventListener('click', () => {
+    if (button.dataset.markCard) void updateCardState(button.dataset.markCard, 'mark')
+  }))
+  document.querySelectorAll<HTMLElement>('[data-suspend-card]').forEach((button) => button.addEventListener('click', () => {
+    if (button.dataset.suspendCard) void updateCardState(button.dataset.suspendCard, 'suspend')
+  }))
+  document.querySelectorAll<HTMLElement>('[data-unbury-card]').forEach((button) => button.addEventListener('click', () => {
+    if (button.dataset.unburyCard) void updateCardState(button.dataset.unburyCard, 'unbury')
+  }))
   document.querySelectorAll<HTMLElement>('[data-edit-card]').forEach((button) => button.addEventListener('click', () => {
     editingId = button.dataset.editCard ?? null
     currentPage = 'add'
@@ -563,24 +783,28 @@ function attachHandlers(): void {
     event.preventDefault()
     const current = await getSettings()
     const data = new FormData(settingsForm)
-    const sheetId = String(data.get('sheetId') ?? '').trim()
-    const sheetGid = String(data.get('sheetGid') ?? '').trim()
-    const reviewWebAppUrl = String(data.get('reviewWebAppUrl') ?? '').trim()
-    const reviewWriteToken = String(data.get('reviewWriteToken') ?? '').trim()
+    const appsScriptUrl = String(data.get('appsScriptUrl') ?? '').trim()
+    const accessToken = String(data.get('accessToken') ?? '').trim()
     const newCardsPerDay = Math.min(500, Math.max(0, Number(data.get('newCardsPerDay') ?? 20)))
     const questionTimerSeconds = Math.min(3600, Math.max(10, Number(data.get('questionTimerSeconds') ?? 180)))
-    if (!/^[\w-]+$/.test(sheetId) || !/^\d+$/.test(sheetGid)) {
-      showToast('Spreadsheet IDまたはgidが正しくありません。')
+    const leechThreshold = Math.min(50, Math.max(2, Number(data.get('leechThreshold') ?? 8)))
+    if (appsScriptUrl && !/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec(?:\?.*)?$/.test(appsScriptUrl)) {
+      showToast('Apps Script Web App URLは /exec のURLを入力してください。')
       return
     }
-    if (reviewWebAppUrl && !/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec(?:\?.*)?$/.test(reviewWebAppUrl)) {
-      showToast('Apps Script Web App URLは /exec で終わるURLを入力してください。')
-      return
-    }
-    await saveSettings({ ...current, sheetId, sheetGid, autoSync: data.get('autoSync') === 'on', newCardsPerDay, questionTimerSeconds, reviewWebAppUrl, reviewWriteToken })
+    await saveSettings({
+      ...current,
+      appsScriptUrl,
+      accessToken,
+      autoSync: data.get('autoSync') === 'on',
+      newCardsPerDay,
+      questionTimerSeconds,
+      detailedReviewLogging: data.get('detailedReviewLogging') === 'on',
+      autoSuspendLeeches: data.get('autoSuspendLeeches') === 'on',
+      leechThreshold,
+    })
     showToast('設定を保存しました。')
     await render()
-    void flushPendingReviews()
   })
 
   document.querySelector('[data-action="export-backup"]')?.addEventListener('click', async () => downloadFile(`memory-backup-${localDateKey(Date.now())}.json`, await exportBackup(), 'application/json;charset=utf-8'))
@@ -591,7 +815,7 @@ function attachHandlers(): void {
     try {
       await importBackup(await file.text())
       studyQueueInitialized = false
-      showToast('バックアップを復元しました。')
+      showToast('バックアップを復元しました。ACCESS_TOKENは安全のため復元されません。')
       await render()
     } catch (error) { showToast(error instanceof Error ? error.message : '復元に失敗しました。') }
     finally { input.value = '' }
@@ -622,11 +846,16 @@ function installKeyboardShortcuts(): void {
     if (currentPage !== 'study') return
     const target = event.target as HTMLElement | null
     if (target?.matches('input, textarea, select')) return
-    const choiceKeys: Record<string, 1 | 2 | 3 | 4> = { Digit1: 1, Digit2: 2, Digit3: 3, Digit4: 4 }
+    const choiceKeys: Record<string, ChoicePosition> = { Digit1: 1, Digit2: 2, Digit3: 3 }
     const choice = choiceKeys[event.code]
     if (choice) {
       event.preventDefault()
       selectChoice(choice)
+      return
+    }
+    if (event.code === 'KeyU' && lastUndoReviewId) {
+      event.preventDefault()
+      void undoLastReview()
       return
     }
     if (selectedChoice === null) return
@@ -642,8 +871,8 @@ function installKeyboardShortcuts(): void {
 
 async function autoSync(): Promise<void> {
   const settings = await getSettings()
-  if (settings.autoSync && document.visibilityState === 'visible') await runSheetSync(false)
-  if (document.visibilityState === 'visible') await flushPendingReviews()
+  if (settings.autoSync && settings.appsScriptUrl && settings.accessToken && document.visibilityState === 'visible') await runSheetSync(false)
+  if (document.visibilityState === 'visible') await flushPendingReviews(25, lastUndoReviewId)
 }
 
 async function bootstrap(): Promise<void> {
@@ -652,7 +881,7 @@ async function bootstrap(): Promise<void> {
   installKeyboardShortcuts()
   await render()
   if ('serviceWorker' in navigator) navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch(() => undefined)
-  window.setTimeout(() => void autoSync(), 400)
+  window.setTimeout(() => void autoSync(), 500)
   window.setInterval(() => void autoSync(), 60_000)
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void autoSync() })
   window.addEventListener('online', () => void autoSync())
