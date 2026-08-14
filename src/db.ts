@@ -181,36 +181,31 @@ export async function saveReviewResult(card: MemoryCard, review: ReviewRecord): 
 
 export async function undoPendingReview(id: string): Promise<MemoryCard | null> {
   const db = await openDatabase()
-  const tx = db.transaction([CARD_STORE, REVIEW_STORE], 'readwrite')
-  const reviewStore = tx.objectStore(REVIEW_STORE)
-  const cardStore = tx.objectStore(CARD_STORE)
+  const readTx = db.transaction([CARD_STORE, REVIEW_STORE], 'readonly')
+  const reviewStore = readTx.objectStore(REVIEW_STORE)
+  const cardStore = readTx.objectStore(CARD_STORE)
   const rawReview = await requestToPromise(reviewStore.get(id))
-  if (!rawReview) {
-    tx.abort()
+  const review = rawReview ? normalizeReview(rawReview) : null
+  const rawCard = review ? await requestToPromise(cardStore.get(review.cardId)) : undefined
+  await transactionDone(readTx)
+
+  if (!review || review.sheetSyncStatus === 'sent' || !review.cardBefore || !rawCard) {
     db.close()
     return null
   }
-  const review = normalizeReview(rawReview)
-  if (review.sheetSyncStatus === 'sent' || !review.cardBefore) {
-    tx.abort()
-    db.close()
-    return null
-  }
-  const rawCard = await requestToPromise(cardStore.get(review.cardId))
-  if (!rawCard) {
-    tx.abort()
-    db.close()
-    return null
-  }
+
   const current = normalizeCard(rawCard)
   const restored: MemoryCard = {
     ...current,
+    suspended: false,
     fsrs: review.cardBefore,
     updatedAt: review.cardUpdatedAtBefore ?? current.updatedAt,
   }
-  cardStore.put(restored)
-  reviewStore.delete(review.id)
-  await transactionDone(tx)
+
+  const writeTx = db.transaction([CARD_STORE, REVIEW_STORE], 'readwrite')
+  writeTx.objectStore(CARD_STORE).put(restored)
+  writeTx.objectStore(REVIEW_STORE).delete(review.id)
+  await transactionDone(writeTx)
   db.close()
   return restored
 }
