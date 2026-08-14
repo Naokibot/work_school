@@ -90,9 +90,13 @@ async function sendReview(review: ReviewRecord): Promise<boolean> {
   }
 }
 
-export async function flushPendingReviews(limit = 25): Promise<{ sent: number; pending: number }> {
+export async function flushPendingReviews(
+  limit = 25,
+  excludeReviewId?: string | null,
+): Promise<{ sent: number; pending: number }> {
   const allPending = await getPendingReviews()
-  const batch = allPending.slice(0, limit)
+  const eligible = allPending.filter((review) => review.id !== excludeReviewId)
+  const batch = eligible.slice(0, limit)
   let sent = 0
   for (const review of batch) {
     if (await sendReview(review)) sent += 1
