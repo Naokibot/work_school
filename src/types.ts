@@ -1,11 +1,12 @@
 import type { CardInput, Grade } from 'ts-fsrs'
 
 export type CardSource = 'manual' | 'google-sheet'
+export type ReviewSyncStatus = 'pending' | 'sent'
 
 export interface MemoryCard {
   id: string
-  front: string
-  back: string
+  question: string
+  choices: [string, string, string, string]
   note: string
   deck: string
   tags: string[]
@@ -36,12 +37,18 @@ export interface SerializedFsrsCard {
 export interface ReviewRecord {
   id: string
   cardId: string
+  question: string
+  selectedChoice: 1 | 2 | 3 | 4
+  selectedAnswer: string
+  correct: boolean
+  elapsedMs: number
   rating: Grade
   reviewedAt: number
   scheduledDays: number
   elapsedDays: number
   stateBefore: number
   stateAfter: number
+  sheetSyncStatus: ReviewSyncStatus
 }
 
 export interface Settings {
@@ -50,14 +57,17 @@ export interface Settings {
   sheetGid: string
   autoSync: boolean
   newCardsPerDay: number
+  questionTimerSeconds: number
+  reviewWebAppUrl: string
+  reviewWriteToken: string
   lastSyncAt?: number
   lastSyncMessage?: string
 }
 
 export interface SheetRow {
   row: number
-  front: string
-  back: string
+  question: string
+  choices: [string, string, string, string]
 }
 
 export interface SyncSummary {
@@ -66,6 +76,18 @@ export interface SyncSummary {
   unchanged: number
   skipped: number
   totalRows: number
+}
+
+export interface ReviewSubmission {
+  reviewId: string
+  reviewedAt: string
+  cardId: string
+  question: string
+  selectedChoice: number
+  selectedAnswer: string
+  correct: boolean
+  responseSeconds: number
+  fsrsRating: number
 }
 
 export type FsrsCardInput = CardInput
