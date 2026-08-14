@@ -47,14 +47,21 @@ function parseRows(response: GvizResponse): { rows: SheetRow[]; skipped: number 
     const rowNumber = index + 1
     if (values.every((value) => !value)) return
     if (rowNumber === 1 && isHeaderRow(values)) return
-    if (values.some((value) => !value)) {
+
+    const question = values[0] ?? ''
+    const answer1 = values[1] ?? ''
+    const answer2 = values[2] ?? ''
+    const answer3 = values[3] ?? ''
+    const answer4 = values[4] ?? ''
+    if (![question, answer1, answer2, answer3, answer4].every(Boolean)) {
       skipped += 1
       return
     }
+
     parsed.push({
       row: rowNumber,
-      question: values[0],
-      choices: [values[1], values[2], values[3], values[4]],
+      question,
+      choices: [answer1, answer2, answer3, answer4],
     })
   })
 
