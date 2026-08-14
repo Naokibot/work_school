@@ -54,12 +54,13 @@ function normalizeCard(raw: unknown): MemoryCard {
 
 function normalizeReview(raw: unknown): ReviewRecord {
   const source = raw as Partial<ReviewRecord>
+  const legacyCorrect = Number(source.rating) >= 3
   return {
     ...(source as ReviewRecord),
     question: String(source.question ?? ''),
     selectedChoice: ([1, 2, 3, 4].includes(Number(source.selectedChoice)) ? Number(source.selectedChoice) : 1) as 1 | 2 | 3 | 4,
     selectedAnswer: String(source.selectedAnswer ?? ''),
-    correct: Boolean(source.correct),
+    correct: typeof source.correct === 'boolean' ? source.correct : legacyCorrect,
     elapsedMs: Number.isFinite(source.elapsedMs) ? Number(source.elapsedMs) : 0,
     sheetSyncStatus: source.sheetSyncStatus === 'sent' ? 'sent' : 'pending',
   }
