@@ -2,142 +2,125 @@ import { getAllCards, getSettings, putCards, saveSettings } from './db'
 import { createSchedule } from './scheduler'
 import type { MemoryCard, SheetRow, SyncSummary } from './types'
 
-interface GvizCell {
-  v?: unknown
-  f?: string
+interface ApiCard {
+  row?: unknown
+  question?: unknown
+  correctAnswer?: unknown
+  wrongAnswer1?: unknown
+  wrongAnswer2?: unknown
+  tags?: unknown
 }
 
-interface GvizResponse {
-  status?: string
-  errors?: Array<{ message?: string; detailed_message?: string }>
-  table?: { rows?: Array<{ c?: Array<GvizCell | null> }> }
+interface CardsResponse {
+  ok?: boolean
+  error?: string
+  cards?: ApiCard[]
 }
 
-const CALLBACK_PREFIX = '__workSchoolSheetCallback_'
+const CALLBACK_PREFIX = '__workSchoolCards_'
 
-function asCellText(cell: GvizCell | null | undefined): string {
-  if (!cell) return ''
-  if (typeof cell.f === 'string') return cell.f.trim()
-  if (cell.v === null || cell.v === undefined) return ''
-  return String(cell.v).trim()
+function isWebAppUrl(value: string): boolean {
+  return /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec(?:\?.*)?$/.test(value)
 }
 
-function isHeaderRow(values: string[]): boolean {
-  const normalized = values.map((value) => value.replace(/\s/g, '').toLowerCase())
-  const firstIsQuestion = ['問題', '問題文', 'question'].includes(normalized[0] ?? '')
-  const answers = normalized.slice(1, 5)
-  return firstIsQuestion && answers.every((value, index) => {
-    const n = String(index + 1)
-    return [`答え${n}`, `回答${n}`, `answer${n}`, `choice${n}`].includes(value)
-  })
+function normalizeTags(value: unknown): string[] {
+  const source = Array.isArray(value) ? value.map(String) : String(value ?? '').split(/[,;|]/)
+  return [...new Set(source.map((tag) => tag.trim()).filter(Boolean))]
 }
 
-function parseRows(response: GvizResponse): { rows: SheetRow[]; skipped: number } {
-  if (response.status && response.status !== 'ok') {
-    const detail = response.errors?.map((error) => error.detailed_message || error.message).filter(Boolean).join(' / ')
-    throw new Error(detail || 'Googleスプレッドシートの読み込みに失敗しました。')
-  }
-
-  const sourceRows = response.table?.rows ?? []
-  const parsed: SheetRow[] = []
-  let skipped = 0
-
-  sourceRows.forEach((row, index) => {
-    const values = Array.from({ length: 5 }, (_, column) => asCellText(row.c?.[column]))
-    const rowNumber = index + 1
-    if (values.every((value) => !value)) return
-    if (rowNumber === 1 && isHeaderRow(values)) return
-
-    const question = values[0] ?? ''
-    const answer1 = values[1] ?? ''
-    const answer2 = values[2] ?? ''
-    const answer3 = values[3] ?? ''
-    const answer4 = values[4] ?? ''
-    if (![question, answer1, answer2, answer3, answer4].every(Boolean)) {
-      skipped += 1
-      return
-    }
-
-    parsed.push({
-      row: rowNumber,
-      question,
-      choices: [answer1, answer2, answer3, answer4],
-    })
-  })
-
-  return { rows: parsed, skipped }
-}
-
-function loadViaScriptInjection(sheetId: string, gid: string): Promise<GvizResponse> {
+function loadCards(webAppUrl: string, token: string): Promise<CardsResponse> {
   return new Promise((resolve, reject) => {
     const callbackName = `${CALLBACK_PREFIX}${crypto.randomUUID().replace(/-/g, '')}`
-    const callbackWindow = window as unknown as Record<string, unknown>
+    const target = window as unknown as Record<string, unknown>
     const script = document.createElement('script')
     let settled = false
 
-    const cleanup = () => {
-      delete callbackWindow[callbackName]
+    const finish = (result: CardsResponse | null, error?: Error) => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timeout)
+      delete target[callbackName]
       script.remove()
+      if (error) reject(error)
+      else resolve(result ?? { ok: false, error: 'empty_response' })
     }
 
-    const timeout = window.setTimeout(() => {
-      if (settled) return
-      settled = true
-      cleanup()
-      reject(new Error('Googleスプレッドシートへの接続がタイムアウトしました。'))
-    }, 15_000)
+    const timeout = window.setTimeout(
+      () => finish(null, new Error('暗記カードの読み込みがタイムアウトしました。')),
+      15_000,
+    )
 
-    callbackWindow[callbackName] = (response: GvizResponse) => {
-      if (settled) return
-      settled = true
-      window.clearTimeout(timeout)
-      cleanup()
-      resolve(response)
-    }
-
-    script.onerror = () => {
-      if (settled) return
-      settled = true
-      window.clearTimeout(timeout)
-      cleanup()
-      reject(new Error('Googleスプレッドシートを読み込めません。共有設定と通信状態を確認してください。'))
-    }
-
-    const params = new URLSearchParams({
-      gid,
-      headers: '0',
-      tq: 'select A, B, C, D, E',
-      tqx: `out:json;responseHandler:${callbackName}`,
-    })
-    script.src = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(sheetId)}/gviz/tq?${params.toString()}`
+    target[callbackName] = (result: CardsResponse) => finish(result)
+    const url = new URL(webAppUrl)
+    url.searchParams.set('action', 'cards')
+    url.searchParams.set('token', token)
+    url.searchParams.set('callback', callbackName)
+    url.searchParams.set('_', String(Date.now()))
+    script.src = url.toString()
     script.async = true
+    script.onerror = () => finish(null, new Error('暗記カードを読み込めません。Apps Scriptの設定を確認してください。'))
     document.head.appendChild(script)
   })
 }
 
-function sourceKey(sheetId: string, gid: string, row: number): string {
-  return `google-sheet:${sheetId}:${gid}:row:${row}`
+function parseRows(response: CardsResponse): { rows: SheetRow[]; skipped: number } {
+  if (response.ok !== true) {
+    if (response.error === 'unauthorized') throw new Error('ACCESS_TOKENが一致しません。')
+    throw new Error('Apps Scriptから暗記カードを取得できませんでした。')
+  }
+
+  const rows: SheetRow[] = []
+  let skipped = 0
+  for (const item of response.cards ?? []) {
+    const row = Number(item.row)
+    const question = String(item.question ?? '').trim()
+    const correctAnswer = String(item.correctAnswer ?? '').trim()
+    const wrongAnswer1 = String(item.wrongAnswer1 ?? '').trim()
+    const wrongAnswer2 = String(item.wrongAnswer2 ?? '').trim()
+    if (!Number.isInteger(row) || row < 1 || !question || !correctAnswer || !wrongAnswer1 || !wrongAnswer2) {
+      skipped += 1
+      continue
+    }
+    rows.push({
+      row,
+      question,
+      correctAnswer,
+      distractors: [wrongAnswer1, wrongAnswer2],
+      tags: normalizeTags(item.tags),
+    })
+  }
+  return { rows, skipped }
+}
+
+function sourceKey(row: number): string {
+  return `google-sheet:row:${row}`
 }
 
 function sameContent(card: MemoryCard, row: SheetRow): boolean {
-  return card.question === row.question && card.choices.every((choice, index) => choice === row.choices[index])
+  if (card.question !== row.question || card.correctAnswer !== row.correctAnswer) return false
+  if (!card.distractors.every((choice, index) => choice === row.distractors[index])) return false
+  const left = [...card.tags].sort().join('\u0000')
+  const right = [...row.tags].sort().join('\u0000')
+  return left === right
 }
 
-export async function fetchSheetRows(sheetId: string, gid: string): Promise<{ rows: SheetRow[]; skipped: number }> {
-  if (!/^[\w-]+$/.test(sheetId) || !/^\d+$/.test(gid)) {
-    throw new Error('スプレッドシートIDまたはgidが正しくありません。')
+export async function fetchSheetRows(): Promise<{ rows: SheetRow[]; skipped: number }> {
+  const settings = await getSettings()
+  if (!settings.appsScriptUrl || !settings.accessToken) {
+    throw new Error('設定でApps Script URLとACCESS_TOKENを入力してください。')
   }
-  return parseRows(await loadViaScriptInjection(sheetId, gid))
+  if (!isWebAppUrl(settings.appsScriptUrl)) {
+    throw new Error('Apps Script Web App URLが正しくありません。')
+  }
+  return parseRows(await loadCards(settings.appsScriptUrl, settings.accessToken))
 }
 
 export async function syncGoogleSheet(): Promise<SyncSummary> {
   const settings = await getSettings()
-  const loaded = await fetchSheetRows(settings.sheetId, settings.sheetGid)
+  const loaded = await fetchSheetRows()
   const rows = loaded.rows
   const existing = await getAllCards()
-  const sheetCards = existing.filter(
-    (card) => card.source === 'google-sheet' && card.sourceSheetId === settings.sheetId && card.sourceGid === settings.sheetGid,
-  )
+  const sheetCards = existing.filter((card) => card.source === 'google-sheet')
 
   const unused = new Set(sheetCards.map((card) => card.id))
   const bySourceKey = new Map(sheetCards.filter((card) => card.sourceKey).map((card) => [card.sourceKey!, card]))
@@ -152,7 +135,7 @@ export async function syncGoogleSheet(): Promise<SyncSummary> {
   }
 
   for (const row of rows) {
-    const key = sourceKey(settings.sheetId, settings.sheetGid, row.row)
+    const key = sourceKey(row.row)
     let matched = sheetCards.find((card) => unused.has(card.id) && sameContent(card, row))
     if (!matched) {
       const rowMatch = bySourceKey.get(key)
@@ -166,7 +149,9 @@ export async function syncGoogleSheet(): Promise<SyncSummary> {
         toSave.push({
           ...matched,
           question: row.question,
-          choices: row.choices,
+          correctAnswer: row.correctAnswer,
+          distractors: row.distractors,
+          tags: row.tags,
           sourceKey: key,
           sourceRow: row.row,
           updatedAt: now,
@@ -182,18 +167,19 @@ export async function syncGoogleSheet(): Promise<SyncSummary> {
     toSave.push({
       id: crypto.randomUUID(),
       question: row.question,
-      choices: row.choices,
+      correctAnswer: row.correctAnswer,
+      distractors: row.distractors,
       note: '',
       deck: 'Google Sheets',
-      tags: [],
+      tags: row.tags,
       source: 'google-sheet',
       sourceKey: key,
-      sourceSheetId: settings.sheetId,
-      sourceGid: settings.sheetGid,
       sourceRow: row.row,
       createdAt: now,
       updatedAt: now,
       archived: false,
+      suspended: false,
+      marked: false,
       fsrs: createSchedule(new Date(now)),
     })
     summary.created += 1
