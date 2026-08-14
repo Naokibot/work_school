@@ -10,8 +10,6 @@ const scheduler = fsrs({
   relearning_steps: ['10m'],
 })
 
-export const RATINGS = [Rating.Again, Rating.Hard, Rating.Good, Rating.Easy] as const
-
 function serialize(card: Card): SerializedFsrsCard {
   return {
     due: card.due.getTime(),
@@ -46,21 +44,15 @@ export function createSchedule(now = new Date()): SerializedFsrsCard {
   return serialize(createEmptyCard(now))
 }
 
-export function previewIntervals(card: MemoryCard, now = new Date()): Record<Grade, Date> {
-  const preview = scheduler.repeat(deserialize(card.fsrs), now)
-  return {
-    [Rating.Again]: preview[Rating.Again].card.due,
-    [Rating.Hard]: preview[Rating.Hard].card.due,
-    [Rating.Good]: preview[Rating.Good].card.due,
-    [Rating.Easy]: preview[Rating.Easy].card.due,
-  }
-}
-
-export function reviewCard(card: MemoryCard, grade: Grade, now = new Date()): {
-  card: MemoryCard
-  review: ReviewRecord
-} {
+export function reviewCard(
+  card: MemoryCard,
+  correct: boolean,
+  selectedChoice: 1 | 2 | 3 | 4,
+  elapsedMs: number,
+  now = new Date(),
+): { card: MemoryCard; review: ReviewRecord } {
   const before = deserialize(card.fsrs)
+  const grade: Grade = correct ? Rating.Good : Rating.Again
   const result = scheduler.next(before, now, grade)
 
   return {
@@ -72,20 +64,22 @@ export function reviewCard(card: MemoryCard, grade: Grade, now = new Date()): {
     review: {
       id: crypto.randomUUID(),
       cardId: card.id,
+      question: card.question,
+      selectedChoice,
+      selectedAnswer: card.choices[selectedChoice - 1],
+      correct,
+      elapsedMs: Math.max(0, Math.round(elapsedMs)),
       rating: grade,
       reviewedAt: now.getTime(),
       scheduledDays: result.card.scheduled_days,
       elapsedDays: result.log.elapsed_days,
       stateBefore: before.state,
       stateAfter: result.card.state,
+      sheetSyncStatus: 'pending',
     },
   }
 }
 
-export function isDue(card: MemoryCard, now = Date.now()): boolean {
-  return !card.archived && card.fsrs.due <= now
-}
-
-export function retrievability(card: MemoryCard, now = new Date()): number {
-  return scheduler.get_retrievability(deserialize(card.fsrs), now, false)
+export function isCardComplete(card: MemoryCard): boolean {
+  return Boolean(card.question.trim()) && card.choices.every((choice) => Boolean(choice.trim()))
 }
