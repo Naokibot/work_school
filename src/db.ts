@@ -11,6 +11,7 @@ const DEFAULT_SETTINGS: Settings = {
   sheetId: '147eZ_4pocwkxQSs3QRC0SevZaojcdwK8V7777td_xos',
   sheetGid: '0',
   autoSync: true,
+  newCardsPerDay: 20,
 }
 
 function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
