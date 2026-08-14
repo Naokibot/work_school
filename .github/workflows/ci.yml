@@ -26,5 +26,7 @@ jobs:
           node-version: 22
       - name: Install dependencies
         run: npm install --no-audit --no-fund
+      - name: Validate Apps Script syntax
+        run: cp apps-script/Code.gs /tmp/work-school-apps-script.js && node --check /tmp/work-school-apps-script.js
       - name: Type-check and production build
         run: npm run build
