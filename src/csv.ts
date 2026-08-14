@@ -57,7 +57,8 @@ export function importCardsFromCsv(text: string): MemoryCard[] {
     const correctAnswer = (row[1] ?? '').trim()
     const wrongAnswer1 = (row[2] ?? '').trim()
     const wrongAnswer2 = (row[3] ?? '').trim()
-    if (!question || !correctAnswer || !wrongAnswer1 || !wrongAnswer2) return []
+    const choices = [correctAnswer, wrongAnswer1, wrongAnswer2]
+    if (!question || choices.some((choice) => !choice) || new Set(choices).size !== choices.length) return []
 
     const tags = (row[4] ?? '').split(/[,|;]/).map((tag) => tag.trim()).filter(Boolean)
     const deck = (row[5] ?? '').trim() || 'CSV'
