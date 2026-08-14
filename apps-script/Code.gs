@@ -47,17 +47,36 @@ function configuredSpreadsheet_() {
   return SpreadsheetApp.openById(spreadsheetId);
 }
 
-function problemSheet_(spreadsheet) {
-  const requestedGid = Number(properties_().getProperty('PROBLEM_SHEET_GID') || '0');
+function findSheetByGid_(spreadsheet, propertyName, fallbackIndex) {
+  const configured = properties_().getProperty(propertyName);
   const sheets = spreadsheet.getSheets();
-  const byId = sheets.find(function (sheet) { return sheet.getSheetId() === requestedGid; });
-  return byId || sheets[0];
+  if (configured) {
+    const requestedGid = Number(configured);
+    if (!Number.isInteger(requestedGid) || requestedGid < 0) {
+      throw new Error(propertyName + ' is invalid');
+    }
+    const matched = sheets.find(function (sheet) { return sheet.getSheetId() === requestedGid; });
+    if (!matched) throw new Error(propertyName + ' does not match an existing sheet');
+    return matched;
+  }
+  return sheets[fallbackIndex] || null;
 }
 
-function reviewSheet_(spreadsheet) {
-  const sheets = spreadsheet.getSheets();
-  const sheet = sheets[1] || spreadsheet.insertSheet('Review Log');
-  if (sheet.getLastRow() === 0) {
+function problemSheet_(spreadsheet) {
+  const sheet = findSheetByGid_(spreadsheet, 'PROBLEM_SHEET_GID', 0);
+  if (!sheet) throw new Error('Problem sheet was not found');
+  return sheet;
+}
+
+function reviewSheet_(spreadsheet, initialize) {
+  const problem = problemSheet_(spreadsheet);
+  let sheet = findSheetByGid_(spreadsheet, 'REVIEW_SHEET_GID', 1);
+  if (!sheet && initialize !== false) sheet = spreadsheet.insertSheet('Review Log');
+  if (!sheet) return null;
+  if (sheet.getSheetId() === problem.getSheetId()) {
+    throw new Error('Problem sheet and review sheet must be different');
+  }
+  if (initialize !== false && sheet.getLastRow() === 0) {
     sheet.appendRow(REVIEW_HEADERS);
     sheet.setFrozenRows(1);
   }
@@ -65,6 +84,7 @@ function reviewSheet_(spreadsheet) {
 }
 
 function alreadyRecorded_(sheet, reviewId) {
+  if (!sheet) return false;
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return false;
   return sheet
@@ -75,19 +95,32 @@ function alreadyRecorded_(sheet, reviewId) {
 }
 
 function normalizeTags_(value) {
+  const seen = {};
   return String(value == null ? '' : value)
     .split(/[,;|]/)
     .map(function (tag) { return tag.trim(); })
-    .filter(Boolean);
+    .filter(function (tag) {
+      if (!tag || seen[tag]) return false;
+      seen[tag] = true;
+      return true;
+    });
 }
 
-function cards_() {
-  const spreadsheet = configuredSpreadsheet_();
+function isHeaderRow_(rowNumber, question, correctAnswer) {
+  if (rowNumber !== 1) return false;
+  const first = question.replace(/\s/g, '').toLowerCase();
+  const second = correctAnswer.replace(/\s/g, '').toLowerCase();
+  return ['問題', '問題文', 'question'].indexOf(first) >= 0
+    && ['正解', 'correct', 'correctanswer', 'answer'].indexOf(second) >= 0;
+}
+
+function readCards_(spreadsheet) {
   const sheet = problemSheet_(spreadsheet);
   const lastRow = sheet.getLastRow();
-  if (lastRow < 1) return [];
+  if (lastRow < 1) return { cards: [], skipped: 0 };
   const values = sheet.getRange(1, 1, lastRow, 5).getDisplayValues();
   const cards = [];
+  let skipped = 0;
 
   values.forEach(function (row, index) {
     const question = String(row[0] || '').trim();
@@ -97,12 +130,17 @@ function cards_() {
     const tags = normalizeTags_(row[4]);
     const rowNumber = index + 1;
 
-    const first = question.replace(/\s/g, '').toLowerCase();
-    const second = correctAnswer.replace(/\s/g, '').toLowerCase();
-    if (rowNumber === 1 && ['問題', '問題文', 'question'].indexOf(first) >= 0
-        && ['正解', 'correct', 'correctanswer', 'answer'].indexOf(second) >= 0) return;
-    if (!question && !correctAnswer && !wrongAnswer1 && !wrongAnswer2) return;
-    if (!question || !correctAnswer || !wrongAnswer1 || !wrongAnswer2) return;
+    if (isHeaderRow_(rowNumber, question, correctAnswer)) return;
+    if (!question && !correctAnswer && !wrongAnswer1 && !wrongAnswer2 && tags.length === 0) return;
+    if (!question || !correctAnswer || !wrongAnswer1 || !wrongAnswer2) {
+      skipped += 1;
+      return;
+    }
+    const choices = [correctAnswer, wrongAnswer1, wrongAnswer2];
+    if (new Set(choices).size !== choices.length) {
+      skipped += 1;
+      return;
+    }
 
     cards.push({
       row: rowNumber,
@@ -113,7 +151,30 @@ function cards_() {
       tags: tags,
     });
   });
-  return cards;
+  return { cards: cards, skipped: skipped };
+}
+
+function diagnostics_(spreadsheet) {
+  const problem = problemSheet_(spreadsheet);
+  const review = reviewSheet_(spreadsheet, false);
+  const loaded = readCards_(spreadsheet);
+  return {
+    ok: true,
+    spreadsheetTitle: spreadsheet.getName(),
+    problemSheet: {
+      title: problem.getName(),
+      gid: problem.getSheetId(),
+      lastRow: problem.getLastRow(),
+      validCards: loaded.cards.length,
+      skippedRows: loaded.skipped,
+    },
+    reviewSheet: review ? {
+      title: review.getName(),
+      gid: review.getSheetId(),
+      lastRow: review.getLastRow(),
+      loggedReviews: Math.max(0, review.getLastRow() - 1),
+    } : null,
+  };
 }
 
 function doGet(e) {
@@ -129,13 +190,18 @@ function doGet(e) {
   }
 
   try {
+    const spreadsheet = configuredSpreadsheet_();
     if (action === 'cards') {
-      return jsonp_(callback, { ok: true, cards: cards_() });
+      const loaded = readCards_(spreadsheet);
+      return jsonp_(callback, { ok: true, cards: loaded.cards, skipped: loaded.skipped });
+    }
+    if (action === 'diagnostics') {
+      return callback ? jsonp_(callback, diagnostics_(spreadsheet)) : json_(diagnostics_(spreadsheet));
     }
     if (action === 'review-status') {
       const reviewId = String(params.reviewId || '').trim();
       if (!reviewId) return jsonp_(callback, { ok: false, error: 'missing_review_id', recorded: false });
-      const recorded = alreadyRecorded_(reviewSheet_(configuredSpreadsheet_()), reviewId);
+      const recorded = alreadyRecorded_(reviewSheet_(spreadsheet, true), reviewId);
       return jsonp_(callback, { ok: true, recorded: recorded });
     }
     return callback
@@ -163,7 +229,7 @@ function doPost(e) {
     if (!reviewId) return json_({ ok: false, error: 'missing_review_id' });
 
     const spreadsheet = configuredSpreadsheet_();
-    const sheet = reviewSheet_(spreadsheet);
+    const sheet = reviewSheet_(spreadsheet, true);
     if (alreadyRecorded_(sheet, reviewId)) return json_({ ok: true, duplicate: true });
 
     const reviewedAt = review.reviewedAt ? new Date(review.reviewedAt) : new Date();
