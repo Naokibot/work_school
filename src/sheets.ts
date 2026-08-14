@@ -10,9 +10,7 @@ interface GvizCell {
 interface GvizResponse {
   status?: string
   errors?: Array<{ message?: string; detailed_message?: string }>
-  table?: {
-    rows?: Array<{ c?: Array<GvizCell | null> }>
-  }
+  table?: { rows?: Array<{ c?: Array<GvizCell | null> }> }
 }
 
 const CALLBACK_PREFIX = '__workSchoolSheetCallback_'
@@ -24,36 +22,43 @@ function asCellText(cell: GvizCell | null | undefined): string {
   return String(cell.v).trim()
 }
 
-function isHeaderRow(front: string, back: string): boolean {
-  const f = front.replace(/\s/g, '').toLowerCase()
-  const b = back.replace(/\s/g, '').toLowerCase()
-  return (
-    (['問題', 'question', 'front'].includes(f) && ['答え', '回答', 'answer', 'back'].includes(b)) ||
-    (f === '単語' && ['意味', '答え'].includes(b))
-  )
+function isHeaderRow(values: string[]): boolean {
+  const normalized = values.map((value) => value.replace(/\s/g, '').toLowerCase())
+  const firstIsQuestion = ['問題', '問題文', 'question'].includes(normalized[0] ?? '')
+  const answers = normalized.slice(1, 5)
+  return firstIsQuestion && answers.every((value, index) => {
+    const n = String(index + 1)
+    return [`答え${n}`, `回答${n}`, `answer${n}`, `choice${n}`].includes(value)
+  })
 }
 
-function parseRows(response: GvizResponse): SheetRow[] {
+function parseRows(response: GvizResponse): { rows: SheetRow[]; skipped: number } {
   if (response.status && response.status !== 'ok') {
     const detail = response.errors?.map((error) => error.detailed_message || error.message).filter(Boolean).join(' / ')
     throw new Error(detail || 'Googleスプレッドシートの読み込みに失敗しました。')
   }
 
-  const rows = response.table?.rows ?? []
+  const sourceRows = response.table?.rows ?? []
   const parsed: SheetRow[] = []
+  let skipped = 0
 
-  rows.forEach((row, index) => {
-    const front = asCellText(row.c?.[0])
-    const back = asCellText(row.c?.[1])
+  sourceRows.forEach((row, index) => {
+    const values = Array.from({ length: 5 }, (_, column) => asCellText(row.c?.[column]))
     const rowNumber = index + 1
-
-    if (!front && !back) return
-    if (rowNumber === 1 && isHeaderRow(front, back)) return
-    if (!front || !back) return
-    parsed.push({ row: rowNumber, front, back })
+    if (values.every((value) => !value)) return
+    if (rowNumber === 1 && isHeaderRow(values)) return
+    if (values.some((value) => !value)) {
+      skipped += 1
+      return
+    }
+    parsed.push({
+      row: rowNumber,
+      question: values[0],
+      choices: [values[1], values[2], values[3], values[4]],
+    })
   })
 
-  return parsed
+  return { rows: parsed, skipped }
 }
 
 function loadViaScriptInjection(sheetId: string, gid: string): Promise<GvizResponse> {
@@ -94,7 +99,7 @@ function loadViaScriptInjection(sheetId: string, gid: string): Promise<GvizRespo
     const params = new URLSearchParams({
       gid,
       headers: '0',
-      tq: 'select A, B',
+      tq: 'select A, B, C, D, E',
       tqx: `out:json;responseHandler:${callbackName}`,
     })
     script.src = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(sheetId)}/gviz/tq?${params.toString()}`
@@ -108,10 +113,10 @@ function sourceKey(sheetId: string, gid: string, row: number): string {
 }
 
 function sameContent(card: MemoryCard, row: SheetRow): boolean {
-  return card.front === row.front && card.back === row.back
+  return card.question === row.question && card.choices.every((choice, index) => choice === row.choices[index])
 }
 
-export async function fetchSheetRows(sheetId: string, gid: string): Promise<SheetRow[]> {
+export async function fetchSheetRows(sheetId: string, gid: string): Promise<{ rows: SheetRow[]; skipped: number }> {
   if (!/^[\w-]+$/.test(sheetId) || !/^\d+$/.test(gid)) {
     throw new Error('スプレッドシートIDまたはgidが正しくありません。')
   }
@@ -120,7 +125,8 @@ export async function fetchSheetRows(sheetId: string, gid: string): Promise<Shee
 
 export async function syncGoogleSheet(): Promise<SyncSummary> {
   const settings = await getSettings()
-  const rows = await fetchSheetRows(settings.sheetId, settings.sheetGid)
+  const loaded = await fetchSheetRows(settings.sheetId, settings.sheetGid)
+  const rows = loaded.rows
   const existing = await getAllCards()
   const sheetCards = existing.filter(
     (card) => card.source === 'google-sheet' && card.sourceSheetId === settings.sheetId && card.sourceGid === settings.sheetGid,
@@ -130,15 +136,17 @@ export async function syncGoogleSheet(): Promise<SyncSummary> {
   const bySourceKey = new Map(sheetCards.filter((card) => card.sourceKey).map((card) => [card.sourceKey!, card]))
   const toSave: MemoryCard[] = []
   const now = Date.now()
-  const summary: SyncSummary = { created: 0, updated: 0, unchanged: 0, skipped: 0, totalRows: rows.length }
+  const summary: SyncSummary = {
+    created: 0,
+    updated: 0,
+    unchanged: 0,
+    skipped: loaded.skipped,
+    totalRows: rows.length + loaded.skipped,
+  }
 
   for (const row of rows) {
     const key = sourceKey(settings.sheetId, settings.sheetGid, row.row)
-
-    // First preserve learning history across row insertions/sorting by matching unchanged content.
     let matched = sheetCards.find((card) => unused.has(card.id) && sameContent(card, row))
-
-    // If the content was edited in place, fall back to the row identity.
     if (!matched) {
       const rowMatch = bySourceKey.get(key)
       if (rowMatch && unused.has(rowMatch.id)) matched = rowMatch
@@ -150,8 +158,8 @@ export async function syncGoogleSheet(): Promise<SyncSummary> {
       if (changed) {
         toSave.push({
           ...matched,
-          front: row.front,
-          back: row.back,
+          question: row.question,
+          choices: row.choices,
           sourceKey: key,
           sourceRow: row.row,
           updatedAt: now,
@@ -166,8 +174,8 @@ export async function syncGoogleSheet(): Promise<SyncSummary> {
 
     toSave.push({
       id: crypto.randomUUID(),
-      front: row.front,
-      back: row.back,
+      question: row.question,
+      choices: row.choices,
       note: '',
       deck: 'Google Sheets',
       tags: [],
@@ -188,8 +196,7 @@ export async function syncGoogleSheet(): Promise<SyncSummary> {
   await saveSettings({
     ...settings,
     lastSyncAt: now,
-    lastSyncMessage: `${summary.created}件追加・${summary.updated}件更新`,
+    lastSyncMessage: `${summary.created}件追加・${summary.updated}件更新・${summary.skipped}件スキップ`,
   })
-
   return summary
 }
