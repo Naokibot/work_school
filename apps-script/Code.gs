@@ -33,8 +33,7 @@ function properties_() {
 }
 
 function accessToken_() {
-  const properties = properties_();
-  return properties.getProperty('ACCESS_TOKEN') || properties.getProperty('WRITE_TOKEN') || '';
+  return properties_().getProperty('ACCESS_TOKEN') || '';
 }
 
 function authorized_(token) {
@@ -57,8 +56,7 @@ function problemSheet_(spreadsheet) {
 
 function reviewSheet_(spreadsheet) {
   const sheets = spreadsheet.getSheets();
-  let sheet = sheets.find(function (candidate) { return candidate.getName() === 'Review Log'; });
-  if (!sheet) sheet = sheets[1] || spreadsheet.insertSheet('Review Log');
+  const sheet = sheets[1] || spreadsheet.insertSheet('Review Log');
   if (sheet.getLastRow() === 0) {
     sheet.appendRow(REVIEW_HEADERS);
     sheet.setFrozenRows(1);
@@ -124,7 +122,11 @@ function doGet(e) {
   const action = String(params.action || 'health');
 
   if (action === 'health') return json_({ ok: true, service: 'work_school private study API' });
-  if (!authorized_(params.token)) return callback ? jsonp_(callback, { ok: false, error: 'unauthorized' }) : json_({ ok: false, error: 'unauthorized' });
+  if (!authorized_(params.token)) {
+    return callback
+      ? jsonp_(callback, { ok: false, error: 'unauthorized' })
+      : json_({ ok: false, error: 'unauthorized' });
+  }
 
   try {
     if (action === 'cards') {
@@ -136,10 +138,14 @@ function doGet(e) {
       const recorded = alreadyRecorded_(reviewSheet_(configuredSpreadsheet_()), reviewId);
       return jsonp_(callback, { ok: true, recorded: recorded });
     }
-    return callback ? jsonp_(callback, { ok: false, error: 'unknown_action' }) : json_({ ok: false, error: 'unknown_action' });
+    return callback
+      ? jsonp_(callback, { ok: false, error: 'unknown_action' })
+      : json_({ ok: false, error: 'unknown_action' });
   } catch (error) {
     console.error(error);
-    return callback ? jsonp_(callback, { ok: false, error: 'internal_error' }) : json_({ ok: false, error: 'internal_error' });
+    return callback
+      ? jsonp_(callback, { ok: false, error: 'internal_error' })
+      : json_({ ok: false, error: 'internal_error' });
   }
 }
 
