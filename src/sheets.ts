@@ -15,6 +15,7 @@ interface CardsResponse {
   ok?: boolean
   error?: string
   cards?: ApiCard[]
+  skipped?: unknown
 }
 
 const CALLBACK_PREFIX = '__workSchoolCards_'
@@ -70,14 +71,16 @@ function parseRows(response: CardsResponse): { rows: SheetRow[]; skipped: number
   }
 
   const rows: SheetRow[] = []
-  let skipped = 0
+  const serverSkipped = Number(response.skipped)
+  let skipped = Number.isInteger(serverSkipped) && serverSkipped > 0 ? serverSkipped : 0
   for (const item of response.cards ?? []) {
     const row = Number(item.row)
     const question = String(item.question ?? '').trim()
     const correctAnswer = String(item.correctAnswer ?? '').trim()
     const wrongAnswer1 = String(item.wrongAnswer1 ?? '').trim()
     const wrongAnswer2 = String(item.wrongAnswer2 ?? '').trim()
-    if (!Number.isInteger(row) || row < 1 || !question || !correctAnswer || !wrongAnswer1 || !wrongAnswer2) {
+    const choices = [correctAnswer, wrongAnswer1, wrongAnswer2]
+    if (!Number.isInteger(row) || row < 1 || !question || choices.some((choice) => !choice) || new Set(choices).size !== choices.length) {
       skipped += 1
       continue
     }
