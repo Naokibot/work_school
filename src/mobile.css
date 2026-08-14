@@ -1,0 +1,9 @@
+@media (max-width: 860px) {
+  .mobile-nav { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .mobile-nav button { padding: 0 3px; }
+}
+
+@media (max-width: 430px) {
+  .mobile-nav { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .app-shell { padding-bottom: calc(150px + env(safe-area-inset-bottom)); }
+}
