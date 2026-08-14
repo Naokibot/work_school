@@ -31,7 +31,7 @@ Google Sheets側は、サイトから閲覧できるよう「リンクを知っ�
 
 同期は起動時、オンライン復帰時、アプリが前面に戻った時、およびサイトを開いている間は約60秒ごとに行います。手動同期ボタンもあります。
 
-Google Sheetsから消えた行を同期時に自動削除することはありません。誤操作でFSRS学習履歴まで消えることを防ぐためです。不要なカードはサイト側のカード一覧から削除してください。
+Google Sheetsから消えた行を同期時に自動削除することはありません。誤操作でFSRS学習履歴まで消えることを防ぐためです。Sheets由来カードを完全に消したい場合は、先にスプレッドシートの該当行を削除し、その後サイト側のカード一覧から削除してください。シートに行が残っている限り、次回同期でカードは再作成されます。
 
 ## データ保存について
 
@@ -66,7 +66,16 @@ npm run build
 https://naokibot.github.io/work_school/
 ```
 
-初回のみ、リポジトリの Settings → Pages でGitHub Actionsによる公開が許可されていることを確認してください。workflow側でもPagesの有効化を試みます。
+### 初回だけ必要な設定
+
+このリポジトリでは、GitHub Actionsのトークンだけでは新しいPagesサイト自体を有効化できません。最初の1回だけGitHubの画面で次を設定してください。
+
+1. `work_school` リポジトリを開く
+2. `Settings` → `Pages`
+3. `Build and deployment` の `Source` を `GitHub Actions` にする
+4. `Actions` → `Deploy GitHub Pages` → `Run workflow` を実行する
+
+以後は `main` へのpushだけで自動ビルド・自動デプロイされます。
 
 ## iPadでの利用
 
