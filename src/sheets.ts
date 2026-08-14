@@ -139,7 +139,9 @@ export async function syncGoogleSheet(): Promise<SyncSummary> {
     let matched = sheetCards.find((card) => unused.has(card.id) && sameContent(card, row))
     if (!matched) {
       const rowMatch = bySourceKey.get(key)
-      if (rowMatch && unused.has(rowMatch.id)) matched = rowMatch
+      // A row number alone is not a safe identity after spreadsheet sorting.
+      // Preserve learning history only when the question itself still matches.
+      if (rowMatch && unused.has(rowMatch.id) && rowMatch.question === row.question) matched = rowMatch
     }
 
     if (matched) {
