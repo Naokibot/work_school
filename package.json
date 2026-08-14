@@ -1,0 +1,22 @@
+{
+  "name": "work-school-memory",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "ts-fsrs": "5.4.1"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vite": "8.2.1"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
