@@ -1,4 +1,4 @@
-import { Rating, State } from 'ts-fsrs'
+import { State } from 'ts-fsrs'
 import './styles.css'
 import {
   deleteCard,
@@ -276,7 +276,7 @@ async function renderEditor(): Promise<string> {
   const existing = editingId ? (await getAllCards()).find((card) => card.id === editingId) : undefined
   const title = existing ? 'カードを編集' : 'カードを追加'
   const answerFields = [0, 1, 2, 3].map((index) => `
-    <div class="field"><label for="answer${index + 1}">答え${index + 1}</label><textarea id="answer${index + 1}" name="answer${index + 1}" required>${existing ? escapeHtml(existing.choices[index]) : ''}</textarea></div>
+    <div class="field"><label for="answer${index + 1}">答え${index + 1}</label><textarea id="answer${index + 1}" name="answer${index + 1}" required>${existing ? escapeHtml(existing.choices[index] ?? '') : ''}</textarea></div>
   `).join('')
 
   return `
