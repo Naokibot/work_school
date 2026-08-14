@@ -66,7 +66,7 @@ export function reviewCard(
       cardId: card.id,
       question: card.question,
       selectedChoice,
-      selectedAnswer: card.choices[selectedChoice - 1],
+      selectedAnswer: card.choices[selectedChoice - 1] ?? '',
       correct,
       elapsedMs: Math.max(0, Math.round(elapsedMs)),
       rating: grade,
