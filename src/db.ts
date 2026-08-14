@@ -1,7 +1,7 @@
 import type { MemoryCard, ReviewRecord, Settings } from './types'
 
 const DB_NAME = 'work-school-memory'
-const DB_VERSION = 1
+const DB_VERSION = 2
 const CARD_STORE = 'cards'
 const REVIEW_STORE = 'reviews'
 const SETTINGS_STORE = 'settings'
@@ -12,6 +12,9 @@ const DEFAULT_SETTINGS: Settings = {
   sheetGid: '0',
   autoSync: true,
   newCardsPerDay: 20,
+  questionTimerSeconds: 180,
+  reviewWebAppUrl: '',
+  reviewWriteToken: '',
 }
 
 function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
@@ -29,12 +32,47 @@ function transactionDone(transaction: IDBTransaction): Promise<void> {
   })
 }
 
+function normalizeCard(raw: unknown): MemoryCard {
+  const source = raw as Partial<MemoryCard> & { front?: string; back?: string; choices?: string[] }
+  const rawChoices = Array.isArray(source.choices) ? source.choices : [source.back ?? '', '', '', '']
+  const choices: [string, string, string, string] = [
+    String(rawChoices[0] ?? '').trim(),
+    String(rawChoices[1] ?? '').trim(),
+    String(rawChoices[2] ?? '').trim(),
+    String(rawChoices[3] ?? '').trim(),
+  ]
+  return {
+    ...(source as MemoryCard),
+    question: String(source.question ?? source.front ?? '').trim(),
+    choices,
+    note: String(source.note ?? ''),
+    deck: String(source.deck ?? '一般'),
+    tags: Array.isArray(source.tags) ? source.tags.map(String) : [],
+    archived: Boolean(source.archived),
+  }
+}
+
+function normalizeReview(raw: unknown): ReviewRecord {
+  const source = raw as Partial<ReviewRecord>
+  return {
+    ...(source as ReviewRecord),
+    question: String(source.question ?? ''),
+    selectedChoice: ([1, 2, 3, 4].includes(Number(source.selectedChoice)) ? Number(source.selectedChoice) : 1) as 1 | 2 | 3 | 4,
+    selectedAnswer: String(source.selectedAnswer ?? ''),
+    correct: Boolean(source.correct),
+    elapsedMs: Number.isFinite(source.elapsedMs) ? Number(source.elapsedMs) : 0,
+    sheetSyncStatus: source.sheetSyncStatus === 'sent' ? 'sent' : 'pending',
+  }
+}
+
 export async function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION)
 
     request.onupgradeneeded = () => {
       const db = request.result
+      const tx = request.transaction
+      if (!tx) return
 
       if (!db.objectStoreNames.contains(CARD_STORE)) {
         const cards = db.createObjectStore(CARD_STORE, { keyPath: 'id' })
@@ -48,6 +86,12 @@ export async function openDatabase(): Promise<IDBDatabase> {
         const reviews = db.createObjectStore(REVIEW_STORE, { keyPath: 'id' })
         reviews.createIndex('cardId', 'cardId')
         reviews.createIndex('reviewedAt', 'reviewedAt')
+        reviews.createIndex('sheetSyncStatus', 'sheetSyncStatus')
+      } else {
+        const reviews = tx.objectStore(REVIEW_STORE)
+        if (!reviews.indexNames.contains('sheetSyncStatus')) {
+          reviews.createIndex('sheetSyncStatus', 'sheetSyncStatus')
+        }
       }
 
       if (!db.objectStoreNames.contains(SETTINGS_STORE)) {
@@ -66,16 +110,7 @@ export async function getAllCards(): Promise<MemoryCard[]> {
   const cards = await requestToPromise(tx.objectStore(CARD_STORE).getAll())
   await transactionDone(tx)
   db.close()
-  return cards as MemoryCard[]
-}
-
-export async function getCard(id: string): Promise<MemoryCard | undefined> {
-  const db = await openDatabase()
-  const tx = db.transaction(CARD_STORE, 'readonly')
-  const card = await requestToPromise(tx.objectStore(CARD_STORE).get(id))
-  await transactionDone(tx)
-  db.close()
-  return card as MemoryCard | undefined
+  return (cards as unknown[]).map(normalizeCard)
 }
 
 export async function putCard(card: MemoryCard): Promise<void> {
@@ -105,14 +140,23 @@ export async function saveReviewResult(card: MemoryCard, review: ReviewRecord): 
   db.close()
 }
 
+export async function markReviewSent(id: string): Promise<void> {
+  const db = await openDatabase()
+  const tx = db.transaction(REVIEW_STORE, 'readwrite')
+  const store = tx.objectStore(REVIEW_STORE)
+  const raw = await requestToPromise(store.get(id))
+  if (raw) store.put({ ...raw, sheetSyncStatus: 'sent' })
+  await transactionDone(tx)
+  db.close()
+}
+
 export async function deleteCard(id: string): Promise<void> {
   const db = await openDatabase()
   const tx = db.transaction([CARD_STORE, REVIEW_STORE], 'readwrite')
   tx.objectStore(CARD_STORE).delete(id)
 
   const reviewIndex = tx.objectStore(REVIEW_STORE).index('cardId')
-  const range = IDBKeyRange.only(id)
-  const cursorRequest = reviewIndex.openKeyCursor(range)
+  const cursorRequest = reviewIndex.openKeyCursor(IDBKeyRange.only(id))
   cursorRequest.onsuccess = () => {
     const cursor = cursorRequest.result
     if (cursor) {
@@ -131,7 +175,12 @@ export async function getAllReviews(): Promise<ReviewRecord[]> {
   const reviews = await requestToPromise(tx.objectStore(REVIEW_STORE).getAll())
   await transactionDone(tx)
   db.close()
-  return reviews as ReviewRecord[]
+  return (reviews as unknown[]).map(normalizeReview)
+}
+
+export async function getPendingReviews(): Promise<ReviewRecord[]> {
+  const reviews = await getAllReviews()
+  return reviews.filter((review) => review.sheetSyncStatus !== 'sent')
 }
 
 export async function getSettings(): Promise<Settings> {
@@ -152,22 +201,18 @@ export async function saveSettings(settings: Settings): Promise<void> {
 }
 
 export async function exportBackup(): Promise<string> {
-  const [cards, reviews, settings] = await Promise.all([
-    getAllCards(),
-    getAllReviews(),
-    getSettings(),
-  ])
-  return JSON.stringify({ version: 1, exportedAt: Date.now(), cards, reviews, settings }, null, 2)
+  const [cards, reviews, settings] = await Promise.all([getAllCards(), getAllReviews(), getSettings()])
+  return JSON.stringify({ version: 2, exportedAt: Date.now(), cards, reviews, settings }, null, 2)
 }
 
 export async function importBackup(raw: string): Promise<void> {
   const parsed = JSON.parse(raw) as {
     version?: number
-    cards?: MemoryCard[]
-    reviews?: ReviewRecord[]
-    settings?: Settings
+    cards?: unknown[]
+    reviews?: unknown[]
+    settings?: Partial<Settings>
   }
-  if (parsed.version !== 1 || !Array.isArray(parsed.cards) || !Array.isArray(parsed.reviews)) {
+  if (![1, 2].includes(parsed.version ?? 0) || !Array.isArray(parsed.cards) || !Array.isArray(parsed.reviews)) {
     throw new Error('このバックアップ形式には対応していません。')
   }
 
@@ -177,9 +222,9 @@ export async function importBackup(raw: string): Promise<void> {
   const reviewStore = tx.objectStore(REVIEW_STORE)
   cardStore.clear()
   reviewStore.clear()
-  parsed.cards.forEach((card) => cardStore.put(card))
-  parsed.reviews.forEach((review) => reviewStore.put(review))
-  if (parsed.settings) tx.objectStore(SETTINGS_STORE).put(parsed.settings)
+  parsed.cards.map(normalizeCard).forEach((card) => cardStore.put(card))
+  parsed.reviews.map(normalizeReview).forEach((review) => reviewStore.put(review))
+  if (parsed.settings) tx.objectStore(SETTINGS_STORE).put({ ...DEFAULT_SETTINGS, ...parsed.settings, id: 'settings' })
   await transactionDone(tx)
   db.close()
 }
