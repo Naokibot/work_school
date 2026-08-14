@@ -49,6 +49,7 @@ export interface Settings {
   sheetId: string
   sheetGid: string
   autoSync: boolean
+  newCardsPerDay: number
   lastSyncAt?: number
   lastSyncMessage?: string
 }
