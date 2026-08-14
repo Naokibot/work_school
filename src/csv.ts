@@ -10,7 +10,6 @@ function parseCsvRows(text: string): string[][] {
   for (let i = 0; i < text.length; i += 1) {
     const char = text[i]
     const next = text[i + 1]
-
     if (quoted) {
       if (char === '"' && next === '"') {
         value += '"'
@@ -22,10 +21,8 @@ function parseCsvRows(text: string): string[][] {
       }
       continue
     }
-
-    if (char === '"') {
-      quoted = true
-    } else if (char === ',') {
+    if (char === '"') quoted = true
+    else if (char === ',') {
       row.push(value)
       value = ''
     } else if (char === '\n') {
@@ -33,9 +30,7 @@ function parseCsvRows(text: string): string[][] {
       rows.push(row)
       row = []
       value = ''
-    } else {
-      value += char
-    }
+    } else value += char
   }
 
   if (quoted) throw new Error('CSVの引用符が閉じられていません。')
@@ -57,27 +52,27 @@ export function importCardsFromCsv(text: string): MemoryCard[] {
 
   let start = 0
   const first = rows[0]?.map((value) => value.trim().toLowerCase()) ?? []
-  if (['front', '問題', '単語', 'question'].includes(first[0] ?? '') && ['back', '答え', '意味', 'answer'].includes(first[1] ?? '')) {
-    start = 1
-  }
+  if (['question', '問題', '問題文'].includes(first[0] ?? '')) start = 1
 
   const now = Date.now()
   return rows.slice(start).flatMap((row): MemoryCard[] => {
-    const front = (row[0] ?? '').trim()
-    const back = (row[1] ?? '').trim()
-    if (!front || !back) return []
+    const question = (row[0] ?? '').trim()
+    const choices: [string, string, string, string] = [
+      (row[1] ?? '').trim(),
+      (row[2] ?? '').trim(),
+      (row[3] ?? '').trim(),
+      (row[4] ?? '').trim(),
+    ]
+    if (!question || choices.some((choice) => !choice)) return []
 
-    const deck = (row[2] ?? '').trim() || 'CSV'
-    const tags = (row[3] ?? '')
-      .split(/[|;]/)
-      .map((tag) => tag.trim())
-      .filter(Boolean)
-    const note = (row[4] ?? '').trim()
+    const deck = (row[5] ?? '').trim() || 'CSV'
+    const tags = (row[6] ?? '').split(/[|;]/).map((tag) => tag.trim()).filter(Boolean)
+    const note = (row[7] ?? '').trim()
 
     return [{
       id: crypto.randomUUID(),
-      front,
-      back,
+      question,
+      choices,
       note,
       deck,
       tags,
@@ -91,11 +86,12 @@ export function importCardsFromCsv(text: string): MemoryCard[] {
 }
 
 export function exportCardsToCsv(cards: MemoryCard[]): string {
-  const lines = [['front', 'back', 'deck', 'tags', 'note'].map(csvCell).join(',')]
+  const header = ['question', 'answer1', 'answer2', 'answer3', 'answer4', 'deck', 'tags', 'note']
+  const lines = [header.map(csvCell).join(',')]
   cards.filter((card) => !card.archived).forEach((card) => {
     lines.push([
-      card.front,
-      card.back,
+      card.question,
+      ...card.choices,
       card.deck,
       card.tags.join('|'),
       card.note,
