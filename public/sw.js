@@ -1,6 +1,6 @@
-const CACHE = 'work-school-memory-v2'
+const CACHE = 'work-school-memory-v3'
 const BASE = '/work_school/'
-const APP_SHELL = [BASE, `${BASE}manifest.webmanifest`, `${BASE}icon.svg`]
+const APP_SHELL = [BASE, `${BASE}manifest.webmanifest`, `${BASE}icon.svg`, `${BASE}features.css`]
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(APP_SHELL)))
