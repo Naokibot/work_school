@@ -2,22 +2,26 @@ import type { CardInput, Grade } from 'ts-fsrs'
 
 export type CardSource = 'manual' | 'google-sheet'
 export type ReviewSyncStatus = 'pending' | 'sent'
+export type ChoicePosition = 1 | 2 | 3
+export type StudyMode = 'scheduled' | 'due' | 'all' | 'forgotten' | 'marked'
 
 export interface MemoryCard {
   id: string
   question: string
-  choices: [string, string, string, string]
+  correctAnswer: string
+  distractors: [string, string]
   note: string
   deck: string
   tags: string[]
   source: CardSource
   sourceKey?: string
-  sourceSheetId?: string
-  sourceGid?: string
   sourceRow?: number
   createdAt: number
   updatedAt: number
   archived: boolean
+  suspended: boolean
+  marked: boolean
+  buriedUntil?: number
   fsrs: SerializedFsrsCard
 }
 
@@ -38,7 +42,8 @@ export interface ReviewRecord {
   id: string
   cardId: string
   question: string
-  selectedChoice: 1 | 2 | 3 | 4
+  tags: string[]
+  selectedChoice: ChoicePosition
   selectedAnswer: string
   correct: boolean
   elapsedMs: number
@@ -49,17 +54,20 @@ export interface ReviewRecord {
   stateBefore: number
   stateAfter: number
   sheetSyncStatus: ReviewSyncStatus
+  cardBefore?: SerializedFsrsCard
+  cardUpdatedAtBefore?: number
 }
 
 export interface Settings {
   id: 'settings'
-  sheetId: string
-  sheetGid: string
   autoSync: boolean
   newCardsPerDay: number
   questionTimerSeconds: number
-  reviewWebAppUrl: string
-  reviewWriteToken: string
+  appsScriptUrl: string
+  accessToken: string
+  detailedReviewLogging: boolean
+  autoSuspendLeeches: boolean
+  leechThreshold: number
   lastSyncAt?: number
   lastSyncMessage?: string
 }
@@ -67,7 +75,9 @@ export interface Settings {
 export interface SheetRow {
   row: number
   question: string
-  choices: [string, string, string, string]
+  correctAnswer: string
+  distractors: [string, string]
+  tags: string[]
 }
 
 export interface SyncSummary {
@@ -82,12 +92,12 @@ export interface ReviewSubmission {
   reviewId: string
   reviewedAt: string
   cardId: string
-  question: string
-  selectedChoice: number
-  selectedAnswer: string
+  tags: string[]
   correct: boolean
   responseSeconds: number
   fsrsRating: number
+  question?: string
+  selectedAnswer?: string
 }
 
 export type FsrsCardInput = CardInput
