@@ -1,27 +1,30 @@
 import { getPendingReviews, getSettings, markReviewSent } from './db'
-import type { ReviewRecord, ReviewSubmission } from './types'
+import type { ReviewRecord, ReviewSubmission, Settings } from './types'
 
 const CALLBACK_PREFIX = '__workSchoolReviewCheck_'
 
-function toSubmission(review: ReviewRecord): ReviewSubmission {
-  return {
+function toSubmission(review: ReviewRecord, settings: Settings): ReviewSubmission {
+  const base: ReviewSubmission = {
     reviewId: review.id,
     reviewedAt: new Date(review.reviewedAt).toISOString(),
     cardId: review.cardId,
-    question: review.question,
-    selectedChoice: review.selectedChoice,
-    selectedAnswer: review.selectedAnswer,
+    tags: [...review.tags],
     correct: review.correct,
     responseSeconds: Math.round(review.elapsedMs / 100) / 10,
     fsrsRating: review.rating,
   }
+  if (settings.detailedReviewLogging) {
+    base.question = review.question
+    base.selectedAnswer = review.selectedAnswer
+  }
+  return base
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
-function confirmRecorded(webAppUrl: string, reviewId: string): Promise<boolean> {
+function confirmRecorded(webAppUrl: string, accessToken: string, reviewId: string): Promise<boolean> {
   return new Promise((resolve) => {
     const callbackName = `${CALLBACK_PREFIX}${crypto.randomUUID().replace(/-/g, '')}`
     const target = window as unknown as Record<string, unknown>
@@ -41,8 +44,11 @@ function confirmRecorded(webAppUrl: string, reviewId: string): Promise<boolean> 
     target[callbackName] = (result: { recorded?: boolean }) => finish(result.recorded === true)
 
     const url = new URL(webAppUrl)
+    url.searchParams.set('action', 'review-status')
+    url.searchParams.set('token', accessToken)
     url.searchParams.set('reviewId', reviewId)
     url.searchParams.set('callback', callbackName)
+    url.searchParams.set('_', String(Date.now()))
     script.src = url.toString()
     script.async = true
     script.onerror = () => finish(false)
@@ -52,17 +58,17 @@ function confirmRecorded(webAppUrl: string, reviewId: string): Promise<boolean> 
 
 async function sendReview(review: ReviewRecord): Promise<boolean> {
   const settings = await getSettings()
-  if (!settings.reviewWebAppUrl || !settings.reviewWriteToken || !navigator.onLine) return false
-  if (!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec(?:\?.*)?$/.test(settings.reviewWebAppUrl)) return false
+  if (!settings.appsScriptUrl || !settings.accessToken || !navigator.onLine) return false
+  if (!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec(?:\?.*)?$/.test(settings.appsScriptUrl)) return false
 
   const payload = JSON.stringify({
-    token: settings.reviewWriteToken,
-    spreadsheetId: settings.sheetId,
-    review: toSubmission(review),
+    token: settings.accessToken,
+    action: 'review',
+    review: toSubmission(review, settings),
   })
 
   try {
-    await fetch(settings.reviewWebAppUrl, {
+    await fetch(settings.appsScriptUrl, {
       method: 'POST',
       mode: 'no-cors',
       cache: 'no-store',
@@ -73,7 +79,7 @@ async function sendReview(review: ReviewRecord): Promise<boolean> {
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
       if (attempt > 0) await delay(500 * attempt)
-      if (await confirmRecorded(settings.reviewWebAppUrl, review.id)) {
+      if (await confirmRecorded(settings.appsScriptUrl, settings.accessToken, review.id)) {
         await markReviewSent(review.id)
         return true
       }
