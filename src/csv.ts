@@ -14,11 +14,8 @@ function parseCsvRows(text: string): string[][] {
       if (char === '"' && next === '"') {
         value += '"'
         i += 1
-      } else if (char === '"') {
-        quoted = false
-      } else {
-        value += char
-      }
+      } else if (char === '"') quoted = false
+      else value += char
       continue
     }
     if (char === '"') quoted = true
@@ -57,43 +54,45 @@ export function importCardsFromCsv(text: string): MemoryCard[] {
   const now = Date.now()
   return rows.slice(start).flatMap((row): MemoryCard[] => {
     const question = (row[0] ?? '').trim()
-    const choices: [string, string, string, string] = [
-      (row[1] ?? '').trim(),
-      (row[2] ?? '').trim(),
-      (row[3] ?? '').trim(),
-      (row[4] ?? '').trim(),
-    ]
-    if (!question || choices.some((choice) => !choice)) return []
+    const correctAnswer = (row[1] ?? '').trim()
+    const wrongAnswer1 = (row[2] ?? '').trim()
+    const wrongAnswer2 = (row[3] ?? '').trim()
+    if (!question || !correctAnswer || !wrongAnswer1 || !wrongAnswer2) return []
 
+    const tags = (row[4] ?? '').split(/[,|;]/).map((tag) => tag.trim()).filter(Boolean)
     const deck = (row[5] ?? '').trim() || 'CSV'
-    const tags = (row[6] ?? '').split(/[|;]/).map((tag) => tag.trim()).filter(Boolean)
-    const note = (row[7] ?? '').trim()
+    const note = (row[6] ?? '').trim()
 
     return [{
       id: crypto.randomUUID(),
       question,
-      choices,
+      correctAnswer,
+      distractors: [wrongAnswer1, wrongAnswer2],
       note,
       deck,
-      tags,
+      tags: [...new Set(tags)],
       source: 'manual',
       createdAt: now,
       updatedAt: now,
       archived: false,
+      suspended: false,
+      marked: false,
       fsrs: createSchedule(new Date(now)),
     }]
   })
 }
 
 export function exportCardsToCsv(cards: MemoryCard[]): string {
-  const header = ['question', 'answer1', 'answer2', 'answer3', 'answer4', 'deck', 'tags', 'note']
+  const header = ['question', 'correct_answer', 'wrong_answer1', 'wrong_answer2', 'tags', 'deck', 'note']
   const lines = [header.map(csvCell).join(',')]
   cards.filter((card) => !card.archived).forEach((card) => {
     lines.push([
       card.question,
-      ...card.choices,
-      card.deck,
+      card.correctAnswer,
+      card.distractors[0],
+      card.distractors[1],
       card.tags.join('|'),
+      card.deck,
       card.note,
     ].map(csvCell).join(','))
   })
