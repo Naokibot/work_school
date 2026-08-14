@@ -95,6 +95,15 @@ export async function putCards(cards: MemoryCard[]): Promise<void> {
   db.close()
 }
 
+export async function saveReviewResult(card: MemoryCard, review: ReviewRecord): Promise<void> {
+  const db = await openDatabase()
+  const tx = db.transaction([CARD_STORE, REVIEW_STORE], 'readwrite')
+  tx.objectStore(CARD_STORE).put(card)
+  tx.objectStore(REVIEW_STORE).put(review)
+  await transactionDone(tx)
+  db.close()
+}
+
 export async function deleteCard(id: string): Promise<void> {
   const db = await openDatabase()
   const tx = db.transaction([CARD_STORE, REVIEW_STORE], 'readwrite')
@@ -111,14 +120,6 @@ export async function deleteCard(id: string): Promise<void> {
     }
   }
 
-  await transactionDone(tx)
-  db.close()
-}
-
-export async function addReview(review: ReviewRecord): Promise<void> {
-  const db = await openDatabase()
-  const tx = db.transaction(REVIEW_STORE, 'readwrite')
-  tx.objectStore(REVIEW_STORE).put(review)
   await transactionDone(tx)
   db.close()
 }
