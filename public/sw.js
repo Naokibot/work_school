@@ -1,4 +1,4 @@
-const CACHE = 'work-school-memory-v1'
+const CACHE = 'work-school-memory-v2'
 const BASE = '/work_school/'
 const APP_SHELL = [BASE, `${BASE}manifest.webmanifest`, `${BASE}icon.svg`]
 
@@ -18,7 +18,6 @@ self.addEventListener('fetch', (event) => {
   const request = event.request
   if (request.method !== 'GET') return
   const url = new URL(request.url)
-
   if (url.origin !== self.location.origin) return
 
   if (request.mode === 'navigate') {
