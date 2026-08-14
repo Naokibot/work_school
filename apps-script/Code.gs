@@ -15,9 +15,23 @@ function json_(value) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
+function jsonp_(callback, value) {
+  const safeCallback = /^[A-Za-z_$][0-9A-Za-z_$]*$/.test(callback || '') ? callback : '';
+  if (!safeCallback) return json_({ ok: false, error: 'invalid_callback' });
+  return ContentService
+    .createTextOutput(safeCallback + '(' + JSON.stringify(value) + ')')
+    .setMimeType(ContentService.MimeType.JAVASCRIPT);
+}
+
 function safeCell_(value) {
   const text = String(value == null ? '' : value);
   return /^[=+\-@]/.test(text) ? "'" + text : text;
+}
+
+function configuredSpreadsheet_() {
+  const spreadsheetId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if (!spreadsheetId) throw new Error('SPREADSHEET_ID is not configured');
+  return SpreadsheetApp.openById(spreadsheetId);
 }
 
 function reviewSheet_(spreadsheet) {
@@ -40,7 +54,20 @@ function alreadyRecorded_(sheet, reviewId) {
     .findNext() !== null;
 }
 
-function doGet() {
+function doGet(e) {
+  const callback = e && e.parameter ? String(e.parameter.callback || '') : '';
+  const reviewId = e && e.parameter ? String(e.parameter.reviewId || '').trim() : '';
+
+  if (callback && reviewId) {
+    try {
+      const recorded = alreadyRecorded_(reviewSheet_(configuredSpreadsheet_()), reviewId);
+      return jsonp_(callback, { recorded: recorded });
+    } catch (error) {
+      console.error(error);
+      return jsonp_(callback, { recorded: false });
+    }
+  }
+
   return json_({ ok: true, service: 'work_school review logger' });
 }
 
@@ -54,12 +81,8 @@ function doPost(e) {
     const writeToken = properties.getProperty('WRITE_TOKEN');
     const spreadsheetId = properties.getProperty('SPREADSHEET_ID');
 
-    if (!writeToken || !spreadsheetId) {
-      return json_({ ok: false, error: 'server_not_configured' });
-    }
-    if (body.token !== writeToken) {
-      return json_({ ok: false, error: 'unauthorized' });
-    }
+    if (!writeToken || !spreadsheetId) return json_({ ok: false, error: 'server_not_configured' });
+    if (body.token !== writeToken) return json_({ ok: false, error: 'unauthorized' });
     if (body.spreadsheetId && body.spreadsheetId !== spreadsheetId) {
       return json_({ ok: false, error: 'spreadsheet_mismatch' });
     }
@@ -70,9 +93,7 @@ function doPost(e) {
 
     const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
     const sheet = reviewSheet_(spreadsheet);
-    if (alreadyRecorded_(sheet, reviewId)) {
-      return json_({ ok: true, duplicate: true });
-    }
+    if (alreadyRecorded_(sheet, reviewId)) return json_({ ok: true, duplicate: true });
 
     sheet.appendRow([
       safeCell_(reviewId),
