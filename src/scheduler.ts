@@ -1,4 +1,4 @@
-import { createEmptyCard, fsrs, Rating, type Card, type Grade } from 'ts-fsrs'
+import { createEmptyCard, fsrs, Rating, State, type Card, type Grade } from 'ts-fsrs'
 import type { MemoryCard, ReviewRecord, SerializedFsrsCard } from './types'
 
 const scheduler = fsrs({
@@ -37,7 +37,7 @@ function deserialize(card: SerializedFsrsCard): Card {
     learning_steps: card.learning_steps,
     reps: card.reps,
     lapses: card.lapses,
-    state: card.state,
+    state: card.state as State,
     last_review: card.last_review ? new Date(card.last_review) : undefined,
   }
 }
